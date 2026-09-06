@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("gbon\x000\xd1g[]int64\xd8eint64\b\x84\x02 !\x92\x04\x01\b\x02")

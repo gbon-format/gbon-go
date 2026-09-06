@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("gbon\x000\xdc\fj00\xea\x8000\xea\x8000")

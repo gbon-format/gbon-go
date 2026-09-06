@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("gbon\x000\xd3l\x17map[string]interface {}\xdc\ff000000\xd6a0000")

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("gbon\x000\xdc\x0fgbig.Int\x00")

@@ -1,0 +1,42 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27'
+      - name: gofmt gate
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "$out"; echo "fmt gate failed"; exit 1; fi
+      - name: build+vet
+        run: go build ./... && go vet ./...
+      - name: import isolation
+        run: ./scripts/importcheck.sh
+      - name: test with race and coverage
+        run: go test -race -coverprofile=cover.out -covermode=atomic ./...
+      - name: coverage gate
+        run: |
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "coverage total: ${total}%"
+          awk -v t="$total" 'BEGIN { exit (t < 80) ? 1 : 0 }' \
+            || { echo "coverage gate failed: ${total}% < 80%"; exit 1; }
+      - name: heap property (no race)
+        run: go test -run '^TestStreamingLargePayload$' -count=1 .
+      - name: fuzz smoke (FuzzRT)
+        run: go test -run '^$' -fuzz '^FuzzRT$' -fuzztime 20s .
+      - name: fuzz smoke (FuzzDecode)
+        run: go test -run '^$' -fuzz '^FuzzDecode$' -fuzztime 20s .
+      - name: fuzz smoke (FuzzTrustedWindow)
+        run: go test -run '^$' -fuzz '^FuzzTrustedWindow$' -fuzztime 20s .
+      - name: lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+          "$(go env GOPATH)/bin/golangci-lint" run
+

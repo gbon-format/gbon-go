@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("gbon\x000\xd9fuint64\b?\x00\x00\x00\x000000")

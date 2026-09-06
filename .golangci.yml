@@ -1,0 +1,16 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - unused
+  settings:
+    staticcheck:
+      # QF* quickfix suggestions (e.g. QF1011 omit-type-from-declaration)
+      # conflict with deliberate signature assertions in tests.
+      checks:
+        - all
+        - -QF*
