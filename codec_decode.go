@@ -253,14 +253,9 @@ func withOffset(err error, off int) error {
 	return err
 }
 
-// allocPanicError converts a decode-time panic into an ErrBudget wrap.// Expected coverage is exactly the reflect allocation panics that survive
-// the budget gates: a crafted backing length admitted by user-raised
-// limits can still make reflect.MakeSlice/MakeMap panic at the allocation
-// itself. The recover is deliberately broader than that class — any
-// decoder panic becomes ErrBudget, never a process crash (wire-format
-// never a hang); the cost, a non-allocation decoder bug surfacing as ErrBudget,
-// is a registered limitation. Stack exhaustion is not recoverable
-// and is prevented by the depth budgets, including the coder facade.
+// allocPanicError converts a decode-time panic into an ErrBudget wrap: a crafted backing
+// length admitted by user-raised limits panics at the allocation; a non-allocation bug
+// surfacing as ErrBudget is a registered limitation; stack exhaustion is prevented by depth budgets.
 func (d *codecDecoder) allocPanicError(p any) error {
 	return d.fail(errBudget(classBudgetAlloc, -1, "", nil, nil, errDetail(fmt.Sprintf("allocation during decode exceeded limits: %v", p))))
 }
@@ -1113,7 +1108,6 @@ func (d *codecDecoder) decodeSlice(desc *wire.Desc, target reflect.Value, p path
 	backing := reflect.MakeSlice(target.Type(), int(L), int(L))
 	// Record-then-fill: the backing registers before its elements, so a
 	// view over this record from inside the element list resolves
-	//.
 	d.shared[id] = backing
 	if err := d.decodeElems(desc.Refs[0], backing, E, p); err != nil {
 		return err
@@ -2180,6 +2174,9 @@ func (d *codecDecoder) skipStringToken(path string) error {
 // reconstructed target, or a fresh allocation registered before its children
 // decode (two-phase; cycles close through the registered id).
 func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pathNode) error {
+	if desc.Refs[0].Kind == wire.KindInterface {
+		return d.decodePtrToIface(desc, target, p)
+	}
 	class, err := d.r.PeekClass()
 	if err != nil {
 		return d.mapErr(err)
@@ -2212,6 +2209,71 @@ func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pa
 		// zero-size targets are not tracked: the encoder reserves
 		// no id for them, so the decoder registers none — mirroring keeps
 		// subsequent REF ids aligned
+		if target.Type().Elem().Size() != 0 {
+			d.r.RegisterValue(pv)
+		}
+		if err := d.decodeBody(desc.Refs[0], pv.Elem(), p); err != nil {
+			return err
+		}
+		target.Set(pv)
+		return nil
+	}
+}
+
+// decodePtrToIface reconstructs a pointer to an interface pointee. A leading REF
+// is the dynamic-type tag (descriptor) or the cycle ref (object); a leading nil
+// selector marks the nil pointer or the nil-interface pointee.
+func (d *codecDecoder) decodePtrToIface(desc *wire.Desc, target reflect.Value, p pathNode) error {
+	class, err := d.r.PeekClass()
+	if err != nil {
+		return d.mapErr(err)
+	}
+	switch class {
+	case wire.ClassNil:
+		k, err := d.r.ReadNil()
+		if err != nil {
+			return d.mapErr(err)
+		}
+		if k == wire.NilPointer {
+			target.Set(reflect.Zero(target.Type()))
+			return nil
+		}
+		if k != wire.NilInterface {
+			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("nil selector %d for pointer to interface", k))))
+		}
+		pv := reflect.New(target.Type().Elem())
+		if target.Type().Elem().Size() != 0 {
+			d.r.RegisterValue(pv)
+		}
+		target.Set(pv)
+		return nil
+	case wire.ClassRef:
+		id, err := d.r.ReadRef()
+		if err != nil {
+			return d.mapErr(err)
+		}
+		if pv, err := d.r.ValueAt(id); err == nil {
+			if !pv.IsValid() || pv.Type() != target.Type() {
+				return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not a %s target", id, target.Type()))))
+			}
+			target.Set(pv)
+			return nil
+		}
+		cd, err := d.r.DescAt(id)
+		if err != nil {
+			return d.mapErr(err)
+		}
+		pv := reflect.New(target.Type().Elem())
+		if target.Type().Elem().Size() != 0 {
+			d.r.RegisterValue(pv)
+		}
+		if err := d.resolveConcrete(cd, pv.Elem(), p); err != nil {
+			return err
+		}
+		target.Set(pv)
+		return nil
+	default:
+		pv := reflect.New(target.Type().Elem())
 		if target.Type().Elem().Size() != 0 {
 			d.r.RegisterValue(pv)
 		}

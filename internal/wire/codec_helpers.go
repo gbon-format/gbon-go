@@ -93,10 +93,22 @@ func (r *Reader) ValueAt(id uint64) (reflect.Value, error) {
 	return r.vals[id], nil
 }
 
-// MapAt returns the map object registered for record id.
-// The id must resolve to a materialized map record; a REF to any other
-// record sort — or to a skipped, never-materialized map record — is a
-// format error.
+// DescAt returns the descriptor registered for id; a REF to any other
+// record sort is a format error.
+func (r *Reader) DescAt(id uint64) (*Desc, error) {
+	kind, err := r.kindAt(id)
+	if err != nil {
+		return nil, err
+	}
+	if kind != entryDesc {
+		return nil, werr(kindBadRef, "wire: ref %d is not a descriptor", id)
+	}
+	return r.descs[id], nil
+}
+
+// MapAt returns the map object registered for record id. The id must
+// resolve to a materialized map record; a REF to any other record sort —
+// or to a skipped, never-materialized map record — is a format error.
 func (r *Reader) MapAt(id uint64) (reflect.Value, error) {
 	kind, err := r.kindAt(id)
 	if err != nil {

@@ -507,3 +507,186 @@ func TestStatelessCompositeAny(t *testing.T) {
 		})
 	}
 }
+
+// A self-referential interface value closes its cycle through the
+// decoded pointer: the pointee interface holds the pointer to itself.
+func TestPtrToIfaceSelfCycle(t *testing.T) {
+	var x any
+	x = &x
+	var buf bytes.Buffer
+	enc := gbon.NewEncoder(&buf)
+	if err := enc.Encode(x); err != nil {
+		t.Fatal(err)
+	}
+	dec := ifaceDecoder(t, buf.Bytes(), new(any))
+	var out any
+	if err := dec.Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	p, ok := out.(*any)
+	if !ok || p == nil {
+		t.Fatalf("got %#v, want non-nil *any", out)
+	}
+	if *p != p {
+		t.Fatalf("cycle not preserved: *p != p")
+	}
+}
+
+// A pointer to a nil interface decodes to a non-nil pointer whose
+// pointee stays a nil interface.
+func TestPtrToIfaceNilPointee(t *testing.T) {
+	var q any
+	p := &q
+	dec := ifaceDecoder(t, mustMarshal(t, p), new(any))
+	var out *any
+	if err := dec.Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out == nil {
+		t.Fatal("pointer must be non-nil")
+	}
+	if *out != nil {
+		t.Fatalf("pointee must stay a nil interface, got %#v", *out)
+	}
+}
+
+// A pointer to an interface holding a typed nil decodes to a non-nil
+// interface with a nil dynamic value, distinct from a nil interface.
+func TestPtrToIfaceTypedNil(t *testing.T) {
+	var q any = (*any)(nil)
+	p := &q
+	dec := ifaceDecoder(t, mustMarshal(t, p), new(any))
+	var out *any
+	if err := dec.Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out == nil {
+		t.Fatal("pointer must be non-nil")
+	}
+	if *out == nil {
+		t.Fatal("typed nil collapsed to nil interface")
+	}
+	inner, ok := (*out).(*any)
+	if !ok || inner != nil {
+		t.Fatalf("want typed nil (*any)(nil), got %#v", *out)
+	}
+}
+
+// A pointer-to-interface struct field round-trips its cycle through the
+// interface position.
+func TestPtrToIfaceStructField(t *testing.T) {
+	type PF struct{ P *any }
+	var c any
+	c = &c
+	pf := PF{P: &c}
+	dec := ifaceDecoder(t, mustMarshal(t, pf), new(any))
+	var out PF
+	if err := dec.Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.P == nil {
+		t.Fatal("field pointer must be non-nil")
+	}
+	v, ok := (*out.P).(*any)
+	if !ok || v != out.P {
+		t.Fatalf("field cycle not preserved: %#v vs %v", *out.P, out.P)
+	}
+}
+
+// Crafted pointer-to-interface positions with a mis-sorted leading
+// token keep their error classes: a REF to an object of a different
+// pointer type and a REF to a non-descriptor record are bad_ref, a map
+// nil selector is malformed_op, and a self-referential tag chain
+// exhausts the depth budget.
+func TestPtrToIfaceRefNegatives(t *testing.T) {
+	// (a) REF to an object record of a different pointer type
+	c := newCraft()
+	c.descPos(dPtr(dInt64))
+	rec := c.ptrRec()
+	c.intTok(7)
+	c.descPos(dPtr(dIface))
+	c.refTok(rec)
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	var i *int64
+	if err := dec.Decode(&i); err != nil {
+		t.Fatalf("(a) value 1: %v", err)
+	}
+	if err := dec.Register(new(any)); err != nil {
+		t.Fatal(err)
+	}
+	var outA *any
+	err := dec.Decode(&outA)
+	if !errors.Is(err, gbon.ErrFormat) {
+		t.Fatalf("(a): want ErrFormat, got %v", err)
+	}
+	var ae *gbon.Error
+	if !errors.As(err, &ae) || ae.Class() != "bad_ref" {
+		t.Fatalf("(a): want class bad_ref, got %v", err)
+	}
+
+	// (b) REF to a string record (non-descriptor sort)
+	c2 := newCraft()
+	c2.descPos(dString)
+	c2.strPos("x")
+	c2.descPos(dPtr(dIface))
+	c2.refTok(craftRec{id: 2})
+	dec2 := gbon.NewDecoder(bytes.NewReader(c2.buf))
+	var s string
+	if err := dec2.Decode(&s); err != nil {
+		t.Fatalf("(b) value 1: %v", err)
+	}
+	if err := dec2.Register(new(any)); err != nil {
+		t.Fatal(err)
+	}
+	var outB *any
+	err = dec2.Decode(&outB)
+	if !errors.Is(err, gbon.ErrFormat) {
+		t.Fatalf("(b): want ErrFormat, got %v", err)
+	}
+	var be *gbon.Error
+	if !errors.As(err, &be) || be.Class() != "bad_ref" {
+		t.Fatalf("(b): want class bad_ref, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "is not a descriptor") {
+		t.Fatalf("(b): want the descriptor-sort text, got %v", err)
+	}
+
+	// (c) map nil selector in a pointer-to-interface body
+	c3 := newCraft()
+	c3.descPos(dPtr(dIface))
+	c3.nilTok(2)
+	dec3 := gbon.NewDecoder(bytes.NewReader(c3.buf))
+	if err := dec3.Register(new(any)); err != nil {
+		t.Fatal(err)
+	}
+	var outC *any
+	err = dec3.Decode(&outC)
+	if !errors.Is(err, gbon.ErrFormat) {
+		t.Fatalf("(c): want ErrFormat, got %v", err)
+	}
+	var ce *gbon.Error
+	if !errors.As(err, &ce) || ce.Class() != "malformed_op" {
+		t.Fatalf("(c): want class malformed_op, got %v", err)
+	}
+
+	// (d) self-referential tag chain: depth budget fires, never a hang
+	c4 := newCraft()
+	c4.descPos(dPtr(dIface))
+	d4 := craftRec{id: 0}
+	for range 10002 {
+		c4.refTok(d4)
+	}
+	dec4 := gbon.NewDecoder(bytes.NewReader(c4.buf))
+	if err := dec4.Register(new(any)); err != nil {
+		t.Fatal(err)
+	}
+	var outD *any
+	err = dec4.Decode(&outD)
+	if !errors.Is(err, gbon.ErrBudget) {
+		t.Fatalf("(d): want ErrBudget, got %v", err)
+	}
+	var de *gbon.Error
+	if !errors.As(err, &de) || de.Class() != "budget_depth" {
+		t.Fatalf("(d): want class budget_depth, got %v", err)
+	}
+}

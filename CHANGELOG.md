@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Decode of pointer-to-interface positions: a self-referential interface
+  value, a nil-interface pointee, and a typed-nil pointee round-trip
+  bit-exact (previously rejected as `bad_ref`/`malformed_op`).
+
 ## [0.0.1] - 2026-09-06
 
 ### Added

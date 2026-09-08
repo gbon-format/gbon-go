@@ -19,7 +19,7 @@ import (
 
 // FuzzDecode: arbitrary input into a stateless
 // Unmarshal terminates with success or exactly one sentinel — never a
-// panic, never a hang (budgets guarantee a progress measure). Seeds
+// panic, never a hang; budgets are the progress measure. Seeds
 // are the golden corpus g1..g50 plus truncations and byte flips, and
 // crafted allocation-bomb headers (u32/u32-backing-length container
 // claims) that mutation cannot reach from the legal corpus.

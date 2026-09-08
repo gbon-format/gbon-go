@@ -80,6 +80,39 @@ func TestRegisterValueValueAt(t *testing.T) {
 	}
 }
 
+func TestDescAt(t *testing.T) {
+	// DESC literal (interface kind, empty name) registers the descriptor
+	// at id 0 before its name string.
+	r := NewReader([]byte{0xD6, 0x60})
+	desc, err := r.ReadDesc()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.Kind != KindInterface {
+		t.Fatalf("kind = %d, want interface", desc.Kind)
+	}
+	got, err := r.DescAt(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != desc {
+		t.Fatalf("DescAt(0) = %v, want the read descriptor", got)
+	}
+	// negative: id of an object record
+	r2 := NewReader(nil)
+	if id := r2.RegisterValue(reflect.ValueOf(42)); id != 0 {
+		t.Fatalf("id = %d", id)
+	}
+	if _, err := r2.DescAt(0); !errors.Is(err, ErrFormat) {
+		t.Fatalf("object entry: want ErrFormat, got %v", err)
+	}
+	// negative: unregistered id
+	r3 := NewReader(nil)
+	if _, err := r3.DescAt(7); !errors.Is(err, ErrFormat) {
+		t.Fatalf("unregistered: want ErrFormat, got %v", err)
+	}
+}
+
 func TestPeekClassIsNextNil(t *testing.T) {
 	r := NewReader([]byte{0x01})
 	if c, err := r.PeekClass(); err != nil || c != ClassNil {
