@@ -91,7 +91,11 @@
 // The five attribution families map onto the sentinels: data/format to
 // ErrFormat, budget to ErrBudget, code and contract to ErrUnsupported,
 // env to ErrIO. Decode errors carry a byte offset; errors with a value
-// location carry a path.
+// location carry a path. A nil or typed-nil reader or writer is rejected
+// with a contract_mismatch error, not a panic, and the rejection is not
+// sticky. Panic containment (the budget_alloc guard) is a decode-side
+// mechanism; the encode path has no recover, so a value that panics during
+// encoding propagates the panic.
 //
 // The %v form is one line — gbon: <class>, then the path and offset
 // segments when the class carries that context — and the %+v form
@@ -137,6 +141,7 @@
 //	coder_recursion   code: custom coder re-entered the codec
 //	contract_mismatch contract: decode target breaks the evolution contract
 //	io_read           env: underlying reader failed
+//	io_write          env: underlying writer failed
 //
 // classids-end
 package gbon

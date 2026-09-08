@@ -13,8 +13,8 @@ import (
 // Sentinel errors of the codec error contract. Every error returned by the
 // public API carries exactly one of them through errors.Is, derived from
 // its class by the class-sentinel table below. The fourth sentinel, ErrIO,
-// attributes a failed read on the underlying input stream (an environment
-// fault, distinct from malformed data).
+// attributes a failed read or write on the underlying stream (an
+// environment fault, distinct from malformed data).
 var (
 	// ErrUnsupported reports a value of a category that has no serialized
 	// form: func, chan, unsafe.Pointer, or a struct with unexported fields
@@ -29,9 +29,10 @@ var (
 	// ErrFormat reports malformed wire input.
 	ErrFormat = errors.New("gbon: malformed input")
 
-	// ErrIO reports that the underlying reader failed while decode was
-	// pulling input; the original fault is reachable through Unwrap.
-	ErrIO = errors.New("gbon: underlying input read failed")
+	// ErrIO reports that the underlying stream failed: a read while decode
+	// was pulling input, or a write while encode was flushing output; the
+	// original fault is reachable through Unwrap.
+	ErrIO = errors.New("gbon: underlying stream read or write failed")
 )
 
 // Error class IDs — snake_case strings carried by Error.Class. They are a
@@ -58,12 +59,13 @@ const (
 	classCoderRecursion   = "coder_recursion"
 	classContractMismatch = "contract_mismatch"
 	classIORead           = "io_read"
+	classIOWrite          = "io_write"
 )
 
 // classSentinels is the deterministic class-to-sentinel table: data/format
 // classes map to ErrFormat, budget to ErrBudget, code and contract to
-// ErrUnsupported, env (io_read) to ErrIO. Error.Is answers through this
-// table alone.
+// ErrUnsupported, env (io_read, io_write) to ErrIO. Error.Is answers
+// through this table alone.
 var classSentinels = map[string]error{
 	classBadMagic:         ErrFormat,
 	classTruncated:        ErrFormat,
@@ -85,6 +87,7 @@ var classSentinels = map[string]error{
 	classCoderRecursion:   ErrUnsupported,
 	classContractMismatch: ErrUnsupported,
 	classIORead:           ErrIO,
+	classIOWrite:          ErrIO,
 }
 
 // Error is the structured error type returned by the codec: class (the
@@ -363,6 +366,12 @@ func errUnsupported(class string, path string, got, want any, cause error) *Erro
 // the original fault as the cause.
 func errIO(off int, cause error) *Error {
 	return &Error{class: classIORead, Offset: off, err: cause}
+}
+
+// errIOWrite wraps a failed underlying write: class io_write, no input
+// context, the original fault as the cause.
+func errIOWrite(cause error) *Error {
+	return &Error{class: classIOWrite, Offset: -1, err: cause}
 }
 
 // errRegister builds a registry-conflict error from the caller-facing

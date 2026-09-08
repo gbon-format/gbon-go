@@ -282,13 +282,17 @@ snake_case class ID (`Error.Class`), the input `Offset`, the value
 sentinels answer `errors.Is` — `ErrFormat` (malformed data),
 `ErrBudget` (a named exhausted budget), `ErrUnsupported` (a category
 with no serialized form, a coder fault, a registry conflict), and
-`ErrIO`: a failed read on the underlying stream, distinct from
-malformed data. The message text is one line carrying class and
+`ErrIO`: a failed read or write on the underlying stream, distinct
+from malformed data. The message text is one line carrying class and
 location, interpolates no untrusted input values, and is not
 contractual — class IDs are (additive, never renamed). Trusted-input
 diagnostics (`Decoder.SetTrustedInput`) can additionally carry a
 bounded hexdump window of the input around the failure offset, plus a
-machine triple through `Error.Snippet()`.
+machine triple through `Error.Snippet()`. A nil or typed-nil reader or
+writer is rejected with a `contract_mismatch` error, not a panic, and
+the rejection is not sticky. Panic containment (`budget_alloc`) is a
+decode-side guard; the encode side has no recover — a value that
+panics during encoding propagates the panic.
 
 ## Wire format and versioning
 

@@ -147,6 +147,102 @@ func TestAPIIOFaultInjection(t *testing.T) {
 	}
 }
 
+// oracleFaultWriter accepts up to n bytes on each Write, then reports
+// err (io injection seam for the write side).
+type oracleFaultWriter struct {
+	n   int
+	err error
+}
+
+func (w *oracleFaultWriter) Write(p []byte) (int, error) {
+	take := min(len(p), w.n)
+	return take, w.err
+}
+
+// TestAPIIOWriterFault (SC-C8b): a marker error from the underlying writer at any
+// split point of the flushed stream surfaces as io_write/ErrIO with the fault as
+// the cause and no input context; the sticky channel carries the classified error.
+func TestAPIIOWriterFault(t *testing.T) {
+	good, err := gbon.Marshal([]int64{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := errors.New("APIWRITEFAULT")
+	for n := range good {
+		enc := gbon.NewEncoder(&oracleFaultWriter{n: n, err: marker})
+		err := enc.Encode([]int64{1, 2, 3})
+		if !errors.Is(err, gbon.ErrIO) {
+			t.Fatalf("split at %d: want ErrIO, got %v", n, err)
+		}
+		var ae *gbon.Error
+		if !errors.As(err, &ae) || ae.Class() != "io_write" {
+			t.Fatalf("split at %d: want class io_write, got %v", n, err)
+		}
+		if ae.Unwrap() != marker {
+			t.Fatalf("split at %d: Unwrap must reach the fault: %v", n, ae.Unwrap())
+		}
+		if ae.Offset != -1 || ae.Path != "" {
+			t.Fatalf("split at %d: io_write carries no input context: %+v", n, ae)
+		}
+		err2 := enc.Encode(int64(9))
+		if !errors.Is(err2, gbon.ErrIO) {
+			t.Fatalf("split at %d: sticky repeat must stay ErrIO, got %v", n, err2)
+		}
+		var ae2 *gbon.Error
+		if !errors.As(err2, &ae2) || ae2.Class() != "io_write" {
+			t.Fatalf("split at %d: sticky repeat lost the class: %v", n, err2)
+		}
+	}
+}
+
+// TestAPINilSource (SC-C9): a nil interface or a typed-nil pointer handed to
+// NewDecoder/NewEncoder makes Decode/Encode return a contract_mismatch error
+// in the ErrUnsupported family — no panic; a repeat call re-runs the check.
+func TestAPINilSource(t *testing.T) {
+	assertNilSourceErr := func(t *testing.T, name string, err error) {
+		t.Helper()
+		var ae *gbon.Error
+		if !errors.As(err, &ae) || ae.Class() != "contract_mismatch" {
+			t.Fatalf("%s: want contract_mismatch, got %v", name, err)
+		}
+		if !errors.Is(err, gbon.ErrUnsupported) {
+			t.Fatalf("%s: want the ErrUnsupported family: %v", name, err)
+		}
+	}
+	t.Run("reader", func(t *testing.T) {
+		readers := map[string]io.Reader{
+			"nil-interface": nil,
+			"typed-nil":     (*bytes.Reader)(nil),
+		}
+		for name, r := range readers {
+			dec := gbon.NewDecoder(r)
+			var out apiMarked
+			err := dec.Decode(&out)
+			assertNilSourceErr(t, name, err)
+			err2 := dec.Decode(&out)
+			assertNilSourceErr(t, name+" repeat", err2)
+		}
+	})
+	t.Run("writer", func(t *testing.T) {
+		writers := map[string]io.Writer{
+			"nil-interface": nil,
+			"typed-nil":     (*bytes.Buffer)(nil),
+		}
+		for name, w := range writers {
+			enc := gbon.NewEncoder(w)
+			err := enc.Encode(apiMarked{V: 1})
+			assertNilSourceErr(t, name, err)
+			err2 := enc.Encode(apiMarked{V: 2})
+			assertNilSourceErr(t, name+" repeat", err2)
+		}
+	})
+	// a nil target beside a nil source: one of the two pre-flight
+	// contract_mismatch checks fires — the class is the contract
+	dec := gbon.NewDecoder(nil)
+	err := dec.Decode(nil)
+	assertNilSourceErr(t, "nil target with nil source", err)
+}
+
 // TestAPIIOEOFAttribution (SC-C8a): EOF mid-body is truncated (data
 // attribution, ErrFormat) — including the exact body-boundary cut; a
 // drained multi-value stream reports io.EOF, which is "no more values",

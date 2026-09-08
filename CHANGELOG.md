@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decode of pointer-to-interface positions: a self-referential interface
   value, a nil-interface pointee, and a typed-nil pointee round-trip
   bit-exact (previously rejected as `bad_ref`/`malformed_op`).
+- Encode failures of the underlying writer are now part of the error
+  contract: a failed `Write` during flush returns `io_write` (`ErrIO`)
+  with the fault as the cause (previously the raw writer error escaped
+  the class/sentinel contract).
+- A nil or typed-nil reader or writer returns `contract_mismatch`
+  instead of panicking; the rejection is not sticky.
 
 ## [0.0.1] - 2026-09-06
 

@@ -73,11 +73,22 @@ type Encoder struct {
 	reservedOK map[reflect.Type]bool
 }
 
-// NewEncoder returns an Encoder writing to w.
+// NewEncoder returns an Encoder writing to w. A nil or typed-nil w makes
+// every Encode return a contract_mismatch error; the check is not sticky.
 func NewEncoder(w io.Writer) *Encoder {
 	e := &Encoder{enc: newCodecEncoder(), w: w}
 	e.enc.fac = e
 	return e
+}
+
+// isNilSource reports a nil interface or a typed-nil pointer passed as an
+// io.Reader or io.Writer source.
+func isNilSource(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
 }
 
 // Encode writes one value to the stream. After an error the Encoder is
@@ -85,10 +96,17 @@ func NewEncoder(w io.Writer) *Encoder {
 // inside a Coder's EncodeValue append to the stream buffer without
 // flushing; buffered bytes reach w only at the outermost Encode. A wire
 // name reserved through RegisterReserved on this Encoder gates the call
-// before anything reaches the stream.
+// before anything reaches the stream. A nil or typed-nil writer fails
+// Encode with a contract_mismatch error before anything is encoded; the
+// failure is not sticky.
 func (e *Encoder) Encode(v any) error {
 	if e.err != nil {
 		return e.err
+	}
+	// in-coder sub-encodes never flush; internal sub-marshals reuse a
+	// writer-less facade, so the nil-writer gate applies to the outer Encode.
+	if isNilSource(e.w) && e.enc.inCoder == 0 {
+		return errUnsupported(classContractMismatch, "", nil, nil, errDetail(fmt.Sprintf("writer must be a non-nil value, got %T", e.w)))
 	}
 	if err := e.gateReserved(v); err != nil {
 		return err
@@ -101,6 +119,7 @@ func (e *Encoder) Encode(v any) error {
 		return nil
 	}
 	if err := e.enc.FlushTo(e.w); err != nil {
+		err = errIOWrite(err)
 		e.err = err
 		return err
 	}
@@ -372,7 +391,9 @@ func reservedWireName(name string) bool {
 	return false
 }
 
-// NewDecoder returns a Decoder reading from r. The basic Go types (int,
+// NewDecoder returns a Decoder reading from r. A nil or typed-nil r makes
+// every Decode return a contract_mismatch error; the check is not sticky.
+// The basic Go types (int,
 // int8..int64, uint, uint8..uint64, float32/64, complex64/128, bool,
 // string, []byte, and the basic composites []any, map[string]any,
 // []string, []int64, map[string]string) come pre-registered, so interface
@@ -404,9 +425,11 @@ func (d *Decoder) SetTrustedInput(trusted bool) { d.trusted = trusted }
 // writes the header together with the first value, so a value-less
 // header-only input cannot be the end of a well-formed stream. Errors
 // detected before the
-// stream is consumed — an invalid target, a negative Limits field — leave
-// the Decoder usable. After any other error the Decoder is invalid and
-// every subsequent call returns the same error.
+// stream is consumed — an invalid target, a negative Limits field, a nil
+// or typed-nil reader — leave the Decoder usable; the nil reader fails
+// with a contract_mismatch error and the check is not sticky. After any
+// other error the Decoder is invalid and every subsequent call returns
+// the same error.
 func (d *Decoder) Decode(v any) error {
 	if d.err != nil {
 		return d.err
@@ -422,6 +445,9 @@ func (d *Decoder) Decode(v any) error {
 		return d.cur.decodeSub(v)
 	}
 	if d.dec == nil {
+		if isNilSource(d.src) {
+			return errUnsupported(classContractMismatch, "", nil, nil, errDetail(fmt.Sprintf("reader must be a non-nil value, got %T", d.src)))
+		}
 		sd := &codecStreamDecoder{reg: d.reg, asName: d.asName, coders: d.coders, fac: d}
 		if err := sd.init(d.src); err != nil {
 			d.err = err

@@ -215,6 +215,14 @@ func oracleCorpus(t *testing.T) []oracleCase {
 	var seven int64
 	out = append(out, mk("io_read", "io_read", gbon.ErrIO, fd.Decode(&seven), true, false))
 
+	// env (write side): same attribution shape, the caller-side writer
+	// fault as the cause
+	out = append(out, mk("io_write", "io_write", gbon.ErrIO,
+		func() error {
+			enc := gbon.NewEncoder(&oracleFaultWriter{err: errors.New("ORACLEWRITEFAIL")})
+			return enc.Encode(int64(7))
+		}(), false, false))
+
 	return out
 }
 

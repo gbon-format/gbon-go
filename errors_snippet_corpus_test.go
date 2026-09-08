@@ -1,11 +1,11 @@
 package gbon_test
 
 // The crafted corpus behind the identity baseline and the structured-log
-// probes: one public-API probe per error class, all twenty classes covered.
-// The seventeen probes of the oracle corpus are reused as-is; the three
-// the rest of the classes get dedicated probes here (duplicate key stream, a
-// failing custom coder, a panicking custom coder recovered by the decode
-// panic guard).
+// probes: one public-API probe per error class, all twenty-one classes
+// covered. The eighteen probes of the oracle corpus are reused as-is; the
+// remaining three classes get dedicated probes here (duplicate key
+// stream, a failing custom coder, a panicking custom coder recovered by
+// the decode panic guard).
 
 import (
 	"bytes"
@@ -28,7 +28,7 @@ var snippetClasses = []string{
 	"type_mismatch", "unknown_name",
 	"budget_depth", "budget_nodes", "budget_bytes", "budget_alloc",
 	"unsupported_kind", "register_conflict", "coder_error", "coder_recursion",
-	"contract_mismatch", "io_read",
+	"contract_mismatch", "io_read", "io_write",
 }
 
 type snippetCase struct {
@@ -77,9 +77,9 @@ func snippetCoderStream(t *testing.T, box any, coder gbon.Coder) []byte {
 	return buf.Bytes()
 }
 
-// snippetCorpus builds the twenty-class probe set. Every probe goes through
-// the public API on a crafted input; the returned cases carry distinct
-// classes, asserted against the inventory above.
+// snippetCorpus builds the twenty-one-class probe set. Every probe goes
+// through the public API on a crafted input; the returned cases carry
+// distinct classes, asserted against the inventory above.
 func snippetCorpus(t *testing.T) []snippetCase {
 	t.Helper()
 	var out []snippetCase
