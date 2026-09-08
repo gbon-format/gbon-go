@@ -1,6 +1,7 @@
 package gbon_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,17 +33,14 @@ var refTokenRe = regexp.MustCompile(`§[0-9]+(?:\.[0-9]+)?`)
 // refHeadingRe matches document headings that define a section ID.
 var refHeadingRe = regexp.MustCompile(`(?m)^## .* \[(WF|GO|SA)-([0-9]+)\]\s*$`)
 
-// refSectionWhitelist pins the exact §-forms that remain legal.
-// Empty: no spec documents live in this repository, so no §-form
-// has a carrier. Extension requires a justification entry in this
-// repository's change history. The forms are written with \u00A7 escapes so this
-// file carries no literal §-token for its own gate to reject.
+// refSectionWhitelist pins the exact §-forms that remain legal; empty (no spec
+// documents live here, and \u00A7 escapes keep this file outside its own gate).
+// Extension requires a justification entry in this repository's change history.
 var refSectionWhitelist = []string{}
 
-// refWhitelistTokens is the set of §-form tokens that remain legal,
-// extracted from the whitelist entries: a token is whitelisted by exact
-// match, never by the line it happens to sit in (a whitelisted marker
-// must not legalize any other token sharing its line).
+// refWhitelistTokens is the set of §-form tokens legal by exact match, never by
+// the line they sit in (a whitelisted marker must not legalize any other token
+// sharing its line).
 var refWhitelistTokens = func() map[string]bool {
 	m := make(map[string]bool)
 	for _, w := range refSectionWhitelist {
@@ -84,10 +82,9 @@ func lintRefTokens(path, text string, dict map[string]string) error {
 	return nil
 }
 
-// lintSectionRefs rejects §-form references: in Go sources
-// always; elsewhere every token must match the whitelist exactly
-// (per-token check — a whitelisted marker on the same line does not
-// legalize an alien token).
+// lintSectionRefs rejects §-form references: always in Go sources; elsewhere
+// every token must match the whitelist exactly (per-token check — a whitelisted
+// marker on the same line does not legalize an alien token).
 func lintSectionRefs(path, text string) error {
 	if !strings.Contains(text, "§") {
 		return nil
@@ -115,10 +112,9 @@ func lintSectionRefs(path, text string) error {
 // "`go test`", "golang.org" carry no such token).
 var implFileRe = regexp.MustCompile(`[A-Za-z0-9_./-]+\.go\b`)
 
-// implVocabRe is the closed vocabulary of implementation identifiers
-// that have no legal occurrence in spec documents; the pointing role is
-// carried by GO-n citations. Extension requires a justification entry
-// in this repository's change history (same canon as refSectionWhitelist).
+// implVocabRe is the closed vocabulary of implementation identifiers with no
+// legal occurrence in spec documents; the pointing role is carried by GO-n
+// citations. Extension requires a justification entry (same canon as above).
 var implVocabRe = regexp.MustCompile(`\b(?:RegisterAs|ErrUnsupported|ErrFormat|ErrBudget)\b`)
 
 // markerSpanRe matches the single legal form of a spec-to-impl file
@@ -131,11 +127,9 @@ func isSpecDoc(path string) bool {
 	return strings.HasPrefix(path, "docs/") && strings.HasSuffix(path, ".md")
 }
 
-// lintSpecDirection is the directional guard (spec→impl) over spec
-// documents. File-level: a .go reference is legal only when the whole
-// token sits inside a non-normative marker's target region (per-token
-// check — a marker does not legalize another token sharing its line).
-// Vocabulary: the closed identifier set is rejected outright.
+// lintSpecDirection is the directional guard (spec→impl) over spec documents: a
+// .go reference is legal only inside a non-normative marker's target region
+// (per-token check); the closed identifier vocabulary is rejected outright.
 func lintSpecDirection(path, text string) error {
 	for i, ln := range strings.Split(text, "\n") {
 		spans := markerSpanRe.FindAllStringSubmatchIndex(ln, -1)
@@ -231,6 +225,11 @@ func TestReferenceLint(t *testing.T) {
 				t.Errorf("reference-lint: %v", err)
 			}
 		}
+		if strings.HasSuffix(p, ".go") {
+			if err := lintCommentWidth(p, text); err != nil {
+				t.Errorf("reference-lint: %v", err)
+			}
+		}
 	}
 }
 
@@ -301,9 +300,8 @@ func TestReferenceLintCheckerNegativeFixtures(t *testing.T) {
 }
 
 // TestSpecDirectionGuardNegativeFixtures: negative verification of the
-// directional guard — a green run on the real tree proves nothing unless
-// the guard demonstrably rejects known violations of both classes and
-// stays silent on the adversarial near-miss forms.
+// directional guard — the guard demonstrably rejects known violations of both
+// classes and stays silent on the adversarial near-miss forms.
 func TestSpecDirectionGuardNegativeFixtures(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -333,14 +331,9 @@ func TestSpecDirectionGuardNegativeFixtures(t *testing.T) {
 	}
 }
 
-// Narrative-taxonomy gate (docsync family): five classes of process
-// narrative — stage/origin, considered/rejected, counterfactual,
-// future markers, temporal state — have no legal channel in tracked
-// text. The dictionary mirrors the specification repository's gate
-// branch byte-for-byte (single source); every word is split across
-// adjacent literals so this file carries no matchable copy of its own
-// patterns (same canon as the section whitelist above). CHANGELOG.md,
-// LICENSE, and testdata/ stay outside the contour by design.
+// Narrative-taxonomy gate (docsync family): five classes of process narrative have no legal
+// channel in tracked text; the dictionary mirrors the spec repository's gate branch byte-for-byte,
+// split literals keep this file outside its own scan; CHANGELOG.md, LICENSE, and testdata/ are outside.
 var narrRe = regexp.MustCompile("(?i)" + narrDict)
 
 // narrDict-begin
@@ -368,12 +361,9 @@ func lintNarrative(path, text string) error {
 	return nil
 }
 
-// TestNarrativeLintNegativeFixtures: negative verification of the
-// narrative gate — one red fixture per taxonomy class (the words are
-// assembled at run time, so this file stays outside its own scan), the
-// exemption greens (canonical positioning text, the draft-status clause,
-// the package header, a composite identifier), and the contour bounds
-// (CHANGELOG/LICENSE/testdata outside the scan).
+// TestNarrativeLintNegativeFixtures: negative verification of the narrative gate —
+// one red fixture per taxonomy class (assembled at run time, keeping this file
+// outside its own scan), the exemption greens, and the contour bounds.
 func TestNarrativeLintNegativeFixtures(t *testing.T) {
 	narrProbeNR1 := "pr" + "obe" + " " + "origi" + "nally" + " " + "ad" + "ded"
 	narrProbeNR2 := "pr" + "obe" + " " + "w" + "as" + " " + "consi" + "dered" + " " + "a" + "nd" + " " + "reje" + "cted"
@@ -425,5 +415,313 @@ func TestNarrativeLintNegativeFixtures(t *testing.T) {
 	}
 	if m := narrRe.FindString(string(b)); m != "" {
 		t.Errorf("narrative dictionary matches its own carrier file: %q", m)
+	}
+}
+
+// --- text-form guards: doc-band ratchet, comment width, classids sync ---
+
+var (
+	classTableIDRe = regexp.MustCompile(`^//\s+(\w+)`)
+	classConstIDRe = regexp.MustCompile(`^\tclass\w+\s*=\s*"(\w+)"`)
+)
+
+const (
+	maxDocBlockLines = 3   // doc-block lines a declaration may carry
+	maxCommentRunes  = 120 // runes per full-line comment
+)
+
+var topLevelDeclRe = regexp.MustCompile(`^(func|type|const|var)`)
+
+// scanLongDocBlocks returns the start lines of doc blocks longer than
+// maxDocBlockLines: a maximal run of comment lines directly before a
+// top-level declaration; an empty comment line does not break the run.
+func scanLongDocBlocks(text string) []int {
+	var sites []int
+	lines := strings.Split(text, "\n")
+	runStart, runLen := 0, 0
+	for i, ln := range lines {
+		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "//") {
+			if runStart == 0 {
+				runStart = i + 1
+			}
+			runLen++
+			continue
+		}
+		if runStart != 0 && topLevelDeclRe.MatchString(ln) && runLen > maxDocBlockLines {
+			sites = append(sites, runStart)
+		}
+		runStart, runLen = 0, 0
+	}
+	return sites
+}
+
+// baselineDocBlocks pins the per-file count of long doc blocks at guard
+// introduction (the sweep legacy of the tree): growth in any file fails,
+// shrinkage is silent, and future sweeps revise the map downward.
+var baselineDocBlocks = map[string]int{
+	"alloc_bound_test.go":              1,
+	"codec_bench_test.go":              1,
+	"codec_budget_test.go":             9,
+	"codec_coder_test.go":              6,
+	"codec_containers_test.go":         2,
+	"codec_decode.go":                  28,
+	"codec_desc.go":                    15,
+	"codec_desccache_internal_test.go": 5,
+	"codec_emitindex_internal_test.go": 1,
+	"codec_encode.go":                  42,
+	"codec_firstfit_internal_test.go":  3,
+	"codec_fuzz_stream_test.go":        5,
+	"codec_fuzz_test.go":               14,
+	"codec_golden_test.go":             2,
+	"codec_grouping_internal_test.go":  10,
+	"codec_interface_test.go":          4,
+	"codec_maporder_internal_test.go":  11,
+	"codec_mirror_test.go":             2,
+	"codec_pool_internal_test.go":      3,
+	"codec_prop_test.go":               11,
+	"codec_root_test.go":               1,
+	"codec_rt_test.go":                 3,
+	"codec_scaling_probe_test.go":      1,
+	"codec_stream_test.go":             3,
+	"codec_work_internal_test.go":      2,
+	"crafted_gen_test.go":              5,
+	"errors.go":                        9,
+	"errors_api_test.go":               1,
+	"errors_oracle_test.go":            2,
+	"errors_snippet_corpus_test.go":    2,
+	"example_test.go":                  1,
+	"gbon.go":                          19,
+	"gbon_test.go":                     1,
+	"internal/wire/arg.go":             1,
+	"internal/wire/container.go":       3,
+	"internal/wire/desc.go":            6,
+	"internal/wire/value.go":           6,
+	"internal/wire/wire.go":            11,
+	"race_enabled_test.go":             1,
+	"register_internal_test.go":        1,
+	"reserved.go":                      1,
+	"specvectors_test.go":              1,
+	"topo_gen_test.go":                 5,
+}
+
+// growingFiles returns baseline entries whose current count exceeds the
+// pinned value; entries absent from the baseline count as growth.
+func growingFiles(baseline, current map[string]int) map[string]int {
+	grew := map[string]int{}
+	for f, n := range current {
+		if n > baseline[f] {
+			grew[f] = n - baseline[f]
+		}
+	}
+	return grew
+}
+
+// TestDocBlockBandRatchet: the per-file count of over-band doc blocks
+// never exceeds the pinned baseline; a failure names the grown files.
+func TestDocBlockBandRatchet(t *testing.T) {
+	current := map[string]int{}
+	sites := map[string][]int{}
+	for _, p := range trackedFiles(t) {
+		if !strings.HasSuffix(p, ".go") || strings.HasPrefix(p, "testdata/") {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("doc-band: read %s: %v", p, err)
+		}
+		if s := scanLongDocBlocks(string(b)); len(s) > 0 {
+			current[p] = len(s)
+			sites[p] = s
+		}
+	}
+	for f, delta := range growingFiles(baselineDocBlocks, current) {
+		t.Errorf("doc-band: %s grew by %d long doc blocks (now %d, baseline %d) at lines %v",
+			f, delta, current[f], baselineDocBlocks[f], sites[f])
+	}
+}
+
+// TestDocBlockBandNegativeFixtures: the band scanner and the ratchet
+// demonstrably reject known growth and stay silent on legal forms.
+func TestDocBlockBandNegativeFixtures(t *testing.T) {
+	three := "// a\n// b\n// c\n"
+	four := three + "// d\n"
+	if s := scanLongDocBlocks(three + "func f() {}\n"); len(s) != 0 {
+		t.Fatalf("3-line block must pass, got %v", s)
+	}
+	if s := scanLongDocBlocks(four + "func f() {}\n"); len(s) != 1 || s[0] != 1 {
+		t.Fatalf("4-line block must fail at line 1, got %v", s)
+	}
+	// an empty comment line does not break the run
+	if s := scanLongDocBlocks(four + "//\n// e\nfunc f() {}\n"); len(s) != 1 || s[0] != 1 {
+		t.Fatalf("empty comment line must not break the run, got %v", s)
+	}
+	// a blank line breaks the run: two legal blocks
+	if s := scanLongDocBlocks(three + "\n" + three + "func f() {}\n"); len(s) != 0 {
+		t.Fatalf("blank line must break the run, got %v", s)
+	}
+	// inline comment after code is not a doc block
+	if s := scanLongDocBlocks("x := 1 // trailing\n// a\n// b\n// c\n// d\n_ = x\n"); len(s) != 0 {
+		t.Fatalf("trailing comment must not be a doc block, got %v", s)
+	}
+	// go:build lines are ordinary comment runs
+	if s := scanLongDocBlocks("//go:build linux\n\n// a\n// b\n// c\n// d\nconst c = 1\n"); len(s) != 1 || s[0] != 3 {
+		t.Fatalf("go:build-following run must be counted at line 3, got %v", s)
+	}
+	// ratchet: growth fails, equality and shrinkage pass
+	base := map[string]int{"a.go": 2, "b.go": 1}
+	if g := growingFiles(base, map[string]int{"a.go": 3, "b.go": 1}); len(g) != 1 || g["a.go"] != 1 {
+		t.Fatalf("growth must be attributed: %v", g)
+	}
+	if g := growingFiles(base, map[string]int{"a.go": 2, "b.go": 0}); len(g) != 0 {
+		t.Fatalf("equality and shrinkage must pass: %v", g)
+	}
+	if g := growingFiles(base, map[string]int{"a.go": 1, "b.go": 1, "new.go": 4}); len(g) != 1 || g["new.go"] != 4 {
+		t.Fatalf("unbaselined file counts as growth: %v", g)
+	}
+}
+
+// lintCommentWidth rejects full-line comments wider than maxCommentRunes (runes,
+// not bytes); a region from an `// Output:` line to the closing brace of the
+// enclosing Example is exempt (go vet fixture format); trailing comments are not checked.
+func lintCommentWidth(path, text string) error {
+	var b strings.Builder
+	inOutput := false
+	for i, ln := range strings.Split(text, "\n") {
+		if strings.HasPrefix(ln, "}") {
+			inOutput = false
+		}
+		trimmed := strings.TrimLeft(ln, " \t")
+		if !strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "// Output:") {
+			inOutput = true
+			continue
+		}
+		if inOutput {
+			continue
+		}
+		if n := len([]rune(ln)); n > maxCommentRunes {
+			fmt.Fprintf(&b, "\n%s:%d: %d runes", path, i+1, n)
+		}
+	}
+	if b.Len() > 0 {
+		return errors.New("comment width" + b.String())
+	}
+	return nil
+}
+
+// TestCommentWidthNegativeFixtures: the width checker rejects an over-wide
+// full-line comment and stays silent inside Output regions, on trailing
+// comments, and at the exact threshold.
+func TestCommentWidthNegativeFixtures(t *testing.T) {
+	wide := "// " + strings.Repeat("x", 120) + "\n"
+	if err := lintCommentWidth("a.go", wide); err == nil {
+		t.Fatal("over-wide comment must fail")
+	}
+	exact := "// " + strings.Repeat("x", 117) + "\n" // 120 runes: the threshold is strictly greater
+	if err := lintCommentWidth("a.go", exact); err != nil {
+		t.Fatalf("exact threshold must pass: %v", err)
+	}
+	if err := lintCommentWidth("a.go", "func Example_x() {\n// Output:\n"+wide+"}\n"); err != nil {
+		t.Fatalf("Output region must be exempt: %v", err)
+	}
+	if err := lintCommentWidth("a.go", "x := 1 "+wide); err != nil {
+		t.Fatalf("trailing comment is outside the check: %v", err)
+	}
+}
+
+// classIDTable extracts the class IDs of the doc.go classids table
+// (between the classids markers, one ID per comment line).
+func classIDTable(text string) map[string]bool {
+	ids := map[string]bool{}
+	in := false
+	for ln := range strings.SplitSeq(text, "\n") {
+		switch {
+		case strings.Contains(ln, "classids-begin"):
+			in = true
+		case strings.Contains(ln, "classids-end"):
+			in = false
+		case in:
+			if m := classTableIDRe.FindStringSubmatch(ln); m != nil {
+				ids[m[1]] = true
+			}
+		}
+	}
+	return ids
+}
+
+// constClassIDs extracts the class IDs of the errors.go sentinel table
+// (the string literals of the class constants).
+func constClassIDs(text string) map[string]bool {
+	ids := map[string]bool{}
+	for ln := range strings.SplitSeq(text, "\n") {
+		if m := classConstIDRe.FindStringSubmatch(ln); m != nil {
+			ids[m[1]] = true
+		}
+	}
+	return ids
+}
+
+// classIDDrift diffs the two ID sets: the IDs present in only one of
+// them (table-only first, code-only second).
+func classIDDrift(table, consts map[string]bool) (extraTable, extraConsts []string) {
+	for id := range table {
+		if !consts[id] {
+			extraTable = append(extraTable, id)
+		}
+	}
+	for id := range consts {
+		if !table[id] {
+			extraConsts = append(extraConsts, id)
+		}
+	}
+	return extraTable, extraConsts
+}
+
+// TestClassIDSync: the doc.go classids table and the errors.go class
+// constants are one set — any drift fails with the both-side diff.
+func TestClassIDSync(t *testing.T) {
+	doc, err := os.ReadFile("doc.go")
+	if err != nil {
+		t.Fatalf("classids: read doc.go: %v", err)
+	}
+	code, err := os.ReadFile("errors.go")
+	if err != nil {
+		t.Fatalf("classids: read errors.go: %v", err)
+	}
+	table, consts := classIDTable(string(doc)), constClassIDs(string(code))
+	extraTable, extraConsts := classIDDrift(table, consts)
+	if len(extraTable) > 0 || len(extraConsts) > 0 {
+		t.Fatalf("classids drift: in table only %v; in code only %v", extraTable, extraConsts)
+	}
+	if len(table) == 0 {
+		t.Fatal("classids: both sides empty — the extraction is broken")
+	}
+}
+
+// TestClassIDSyncNegativeFixtures: the sync check demonstrably rejects
+// drift in either direction and passes on equal sets in any order.
+func TestClassIDSyncNegativeFixtures(t *testing.T) {
+	table := "// classids-begin\n// bad_ref — text\n// bad_view — text\n// classids-end\n"
+	code := "const (\n\tclassBadRef = \"bad_ref\"\n\tclassBadView = \"bad_view\"\n)\n"
+	if classIDTable(table)["bad_ref"] != true || len(classIDTable(table)) != 2 {
+		t.Fatal("table extraction broken")
+	}
+	if constClassIDs(code)["bad_view"] != true || len(constClassIDs(code)) != 2 {
+		t.Fatal("code extraction broken")
+	}
+	driftedCode := "const (\n\tclassBadRef = \"bad_ref\"\n)\n"
+	if et, ec := classIDDrift(classIDTable(table), constClassIDs(driftedCode)); len(et) != 1 || len(ec) != 0 {
+		t.Fatalf("drift in code must be detected: %v %v", et, ec)
+	}
+	driftedTable := "// classids-begin\n// bad_ref — text\n// classids-end\n"
+	if et, ec := classIDDrift(classIDTable(driftedTable), constClassIDs(code)); len(et) != 0 || len(ec) != 1 {
+		t.Fatalf("drift in table must be detected: %v %v", et, ec)
+	}
+	// equal sets in any textual order pass (the pin is the set)
+	reordered := "// classids-begin\n// bad_view — text\n// bad_ref — text\n// classids-end\n"
+	if et, ec := classIDDrift(classIDTable(reordered), constClassIDs(code)); len(et) != 0 || len(ec) != 0 {
+		t.Fatalf("equal sets in any order must pass: %v %v", et, ec)
 	}
 }
