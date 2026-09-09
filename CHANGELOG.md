@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-09-09
+
+### Fixed
+
+- Decode of pointer chains of any depth reaching an interface pointee:
+  a leading REF resolves by intern-record sort (dynamic-type tag vs
+  cycle ref) at every chain level, and nil selectors resolve through
+  the chain with outer-nil normalization (previously `**any` and
+  deeper chains failed round-trip with `bad_ref`/`malformed_op`).
+
 ## [0.0.2] - 2026-09-09
 
 ### Fixed
