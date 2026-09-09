@@ -2177,6 +2177,9 @@ func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pa
 	if desc.Refs[0].Kind == wire.KindInterface {
 		return d.decodePtrToIface(desc, target, p)
 	}
+	if ptrChainToIface(desc, target) {
+		return d.decodePtrChainToIface(desc, target, p)
+	}
 	class, err := d.r.PeekClass()
 	if err != nil {
 		return d.mapErr(err)
@@ -2283,4 +2286,88 @@ func (d *codecDecoder) decodePtrToIface(desc *wire.Desc, target reflect.Value, p
 		target.Set(pv)
 		return nil
 	}
+}
+
+// ptrChainToIface reports a pointer chain of at least two levels whose
+// descriptor chain and target type chain are equally long and end at an
+// interface; any mismatch keeps the generic path.
+func ptrChainToIface(desc *wire.Desc, target reflect.Value) bool {
+	if desc.Refs[0].Kind != wire.KindPointer {
+		return false
+	}
+	t := target.Type()
+	for t.Kind() == reflect.Pointer && desc.Refs[0].Kind == wire.KindPointer {
+		t = t.Elem()
+		desc = desc.Refs[0]
+	}
+	return t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Interface &&
+		desc.Kind == wire.KindPointer && desc.Refs[0].Kind == wire.KindInterface
+}
+
+// decodePtrChainToIface decodes a pointer chain of depth ≥2 with an
+// interface leaf: one leading token carries the whole chain's state —
+// nil selector, sort-disambiguated REF, or the fresh DESC literal tag.
+func (d *codecDecoder) decodePtrChainToIface(desc *wire.Desc, target reflect.Value, p pathNode) error {
+	class, err := d.r.PeekClass()
+	if err != nil {
+		return d.mapErr(err)
+	}
+	switch class {
+	case wire.ClassNil:
+		k, err := d.r.ReadNil()
+		if err != nil {
+			return d.mapErr(err)
+		}
+		if k == wire.NilPointer {
+			target.Set(reflect.Zero(target.Type()))
+			return nil
+		}
+		if k != wire.NilInterface {
+			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("nil selector %d for pointer", k))))
+		}
+		slot := d.materializePtrChain(target)
+		slot.Set(reflect.Zero(slot.Type()))
+		return nil
+	case wire.ClassRef:
+		id, err := d.r.ReadRef()
+		if err != nil {
+			return d.mapErr(err)
+		}
+		if pv, err := d.r.ValueAt(id); err == nil {
+			if !pv.IsValid() || pv.Type() != target.Type() {
+				return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not a %s target", id, target.Type()))))
+			}
+			target.Set(pv)
+			return nil
+		}
+		cd, err := d.r.DescAt(id)
+		if err != nil {
+			return d.mapErr(err)
+		}
+		slot := d.materializePtrChain(target)
+		return d.resolveConcrete(cd, slot, p)
+	default:
+		slot := d.materializePtrChain(target)
+		leaf := desc
+		for leaf.Refs[0].Kind == wire.KindPointer {
+			leaf = leaf.Refs[0]
+		}
+		return d.decodeBody(leaf.Refs[0], slot, p)
+	}
+}
+
+// materializePtrChain allocates and registers the non-nil chain level by
+// level, outermost first — the encoder reserves each level's id on entry,
+// before descending — and returns the interface slot at the leaf.
+func (d *codecDecoder) materializePtrChain(target reflect.Value) reflect.Value {
+	slot := target
+	for slot.Type().Kind() != reflect.Interface {
+		pv := reflect.New(slot.Type().Elem())
+		if pv.Type().Elem().Size() != 0 {
+			d.r.RegisterValue(pv)
+		}
+		slot.Set(pv)
+		slot = pv.Elem()
+	}
+	return slot
 }
