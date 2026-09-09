@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-09-09
+
 ### Fixed
 
 - Decode of pointer-to-interface positions: a self-referential interface
@@ -30,5 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never panics, hangs, or surprise allocations.
 - Stdlib-only single module `gbon` (codec, `internal/wire`).
 
-[Unreleased]: https://github.com/gbon-format/gbon-go/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/gbon-format/gbon-go/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/gbon-format/gbon-go/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/gbon-format/gbon-go/releases/tag/v0.0.1
