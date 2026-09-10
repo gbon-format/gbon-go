@@ -397,6 +397,11 @@ func (b *irBuilder) buildNode(label string, n map[string]any) (reflect.Value, er
 		var t reflect.Type
 		switch irString(n, "sort") {
 		case "pointer":
+			// typed nil of a derivable pointer chain (payload (*any)(nil))
+			if dt, ok := deriveIfacePtrChainForTest(irString(n, "type")); ok {
+				t = dt
+				break
+			}
 			t = reflect.TypeFor[*int64]()
 		case "slice":
 			t = reflect.TypeFor[[]int64]()
@@ -413,12 +418,28 @@ func (b *irBuilder) buildNode(label string, n map[string]any) (reflect.Value, er
 	case "struct":
 		return b.buildStruct(n)
 	case "iface":
+		// iface-slot storage: the slot cell registers before its payload
+		// builds, so self-referential payloads resolve through {ref}
+		st := reflect.New(reflect.TypeFor[any]()).Elem()
+		b.storage[label] = st
 		inner, err := b.build(n["value"])
 		if err != nil {
 			return reflect.Value{}, err
 		}
 		if !inner.IsValid() {
 			inner = reflect.Zero(reflect.TypeFor[any]())
+		}
+		// a {ref} payload under a derivable-chain declared type is a REF
+		// in a pointer position: it takes the target storage's address
+		// (REF identity), not a copy of its value
+		if _, isChain := deriveIfacePtrChainForTest(irString(n, "type")); isChain {
+			if rv, ok := n["value"].(map[string]any); ok {
+				if ref, ok := rv["ref"].(string); ok {
+					if target, ok := b.storage[ref]; ok && target.CanAddr() {
+						inner = target.Addr()
+					}
+				}
+			}
 		}
 		// the declared dynamic type fixes the Go representation (KO-4:
 		// int64(1) and int32(1) are distinct keys)
@@ -430,7 +451,8 @@ func (b *irBuilder) buildNode(label string, n map[string]any) (reflect.Value, er
 				inner = inner.Convert(t)
 			}
 		}
-		return inner, nil
+		st.Set(inner)
+		return st, nil
 	}
 	return reflect.Value{}, fmt.Errorf("unbuildable kind %q", nodeKind(n))
 }

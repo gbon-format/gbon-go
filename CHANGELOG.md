@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Decoder reference resolution on the cell model: references are
+  type-erased handles resolved through one intern space with the type
+  on the cell. Reference graphs round-trip exactly — rings and shared
+  edges through pointer, map, slice, and interface positions, at any
+  pointer depth and any entry point (root, interface slot, field,
+  slice element, map value) — and re-encoding is byte-identical.
+- A reference the named cell's sort or type cannot serve rejects with
+  a cell-level bad_ref error; nil pointer-chain roots decode as typed
+  nils; unnamed interface-pointer chains derive on a registry miss in
+  both Decoder and stateless Unmarshal scopes.
+- Conformance corpus reader covers 99 vectors (reference chains over
+  interface points included).
+
 ## [0.0.3] - 2026-09-09
 
 ### Fixed

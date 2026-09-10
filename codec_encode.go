@@ -259,7 +259,7 @@ type classIndex struct {
 
 // intEntry is one component entry in the class live array. The ordering
 // key is the component's creation origin — immutable for the component's
-// lifetime: bridge merges extend a live component's bounds
+// lifetime, because bridge merges extend a live component's bounds
 // leftward past other entries and closed (emitted) regions break
 // end-monotonicity; live bounds are always read from the component
 // itself. A dead entry is a tombstone: the scans skip it, compaction
@@ -483,9 +483,9 @@ func (s *emitSkip) emitQuery(e *codecEncoder, p, send uintptr, out *[]int32) {
 
 // hostKey is the cross-generation identity of one slot window: the
 // exact (pointer, len, cap) geometry within its class. Cached host
-// resolutions are keyed by the full window; narrower keys lose the
-// first-fit-by-sequence join outcome over overlapping frozen spans of
-// different widths.
+// resolutions are keyed by the full window, because a narrower-keyed
+// cache cannot preserve the first-fit-by-sequence join outcome when
+// overlapping frozen spans contain windows of different widths.
 type hostKey struct {
 	es   uintptr
 	ptr  uintptr
@@ -1098,7 +1098,7 @@ func isBitZero(v reflect.Value) bool {
 		return true
 	case reflect.Pointer:
 		// *big.Int: nil and zero encode to the same one-byte body
-		// so both are elision fodder; a non-nil pointer to
+		//, so both are elision fodder; a non-nil pointer to
 		// zero is invisible to reflect IsZero.
 		if v.Type() == bigIntPtrType {
 			b, _ := v.Interface().(*big.Int)

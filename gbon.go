@@ -530,8 +530,10 @@ func (d *Decoder) mapReserved(err error) error {
 // re-registering the same type is a no-op. A type bound through
 // RegisterAs registers under its bound wire name; the order of the
 // Register and RegisterAs calls does not matter. Register does not consume
-// the stream. To decode concrete interface values, use this Decoder (with the
-// types registered) rather than the stateless Unmarshal.
+// the stream. Registration beats derivation: a name bound here resolves
+// through the registry, while unnamed pointer chains to an interface point
+// (with one slice or map[string] level over the chain) derive from their
+// descriptor name even in the stateless Unmarshal scope.
 func (d *Decoder) Register(types ...any) error {
 	for _, ex := range types {
 		t := reflect.TypeOf(ex)

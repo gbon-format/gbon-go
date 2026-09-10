@@ -93,19 +93,6 @@ func (r *Reader) ValueAt(id uint64) (reflect.Value, error) {
 	return r.vals[id], nil
 }
 
-// DescAt returns the descriptor registered for id; a REF to any other
-// record sort is a format error.
-func (r *Reader) DescAt(id uint64) (*Desc, error) {
-	kind, err := r.kindAt(id)
-	if err != nil {
-		return nil, err
-	}
-	if kind != entryDesc {
-		return nil, werr(kindBadRef, "wire: ref %d is not a descriptor", id)
-	}
-	return r.descs[id], nil
-}
-
 // MapAt returns the map object registered for record id. The id must
 // resolve to a materialized map record; a REF to any other record sort —
 // or to a skipped, never-materialized map record — is a format error.
@@ -127,4 +114,74 @@ func (r *Reader) MapAt(id uint64) (reflect.Value, error) {
 // SetMapVal materializes the map object of record id (MakeMap before pairs).
 func (r *Reader) SetMapVal(id uint64, m reflect.Value) {
 	r.vals[id] = m
+}
+
+// RecordKind is the sort of an intern-space record, for codec-side REF
+// disambiguation before token consumption.
+type RecordKind uint8
+
+// Intern-record sorts visible to the codec layer.
+const (
+	RecordOther  RecordKind = 0
+	RecordString RecordKind = 1
+	RecordDesc   RecordKind = 2
+	RecordArray  RecordKind = 3
+	RecordBlob   RecordKind = 4
+	RecordValue  RecordKind = 5
+	RecordMap    RecordKind = 6
+)
+
+// RecordAt reports the sort and stored value of record id. An
+// unregistered id reads as RecordOther; the consuming read surfaces the
+// precise error.
+func (r *Reader) RecordAt(id uint64) (RecordKind, reflect.Value) {
+	kind, err := r.kindAt(id)
+	if err != nil {
+		return RecordOther, reflect.Value{}
+	}
+	switch kind {
+	case entryString:
+		return RecordString, reflect.Value{}
+	case entryDesc:
+		return RecordDesc, reflect.Value{}
+	case entryArray:
+		return RecordArray, reflect.Value{}
+	case entryBlob:
+		return RecordBlob, reflect.Value{}
+	case entryValue:
+		return RecordValue, r.vals[id]
+	case entryMap:
+		return RecordMap, r.vals[id]
+	}
+	return RecordOther, reflect.Value{}
+}
+
+// PeekRef returns the id of a REF token at the current position without
+// consuming anything; ok=false covers every non-REF lookahead outcome
+// (the caller's regular read surfaces the error).
+func (r *Reader) PeekRef() (uint64, bool) {
+	if class, err := r.peekFirst(); err != nil || class != classRef {
+		return 0, false
+	}
+	abs := r.base + r.pos
+	id, err := r.readTokenArg(classRef)
+	r.pos = abs - r.base
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
+// PeekNilKind returns the selector of a NIL-class token at the current
+// position without consuming it; ok=false on any other lookahead
+// outcome, including unknown selectors.
+func (r *Reader) PeekNilKind() (NilKind, bool) {
+	if class, err := r.peekFirst(); err != nil || class != classNil {
+		return 0, false
+	}
+	k := NilKind(r.buf[r.pos] & 0x0F)
+	if k > NilInterface {
+		return 0, false
+	}
+	return k, true
 }

@@ -227,8 +227,9 @@ func TestRootAtomicityPanicBudget(t *testing.T) {
 	}
 }
 
-// Nil root pointer reject in a T target is a loud format error
-// the `*any` nil root stays rejected uniformly.
+// Nil root pointer reject in a T target is a loud format error; a
+// derivable chain root decodes additively as the typed nil of the chain,
+// named roots stay rejected with the registry hint.
 func TestRootNilPointerReject(t *testing.T) {
 	nb, err := gbon.Marshal((*rtS1)(nil))
 	if err != nil {
@@ -244,10 +245,39 @@ func TestRootNilPointerReject(t *testing.T) {
 		t.Fatalf("Marshal(nil *any): %v", err)
 	}
 	var av any = 7
-	if err := gbon.Unmarshal(ab, &av); err == nil {
-		t.Fatal("Unmarshal(nil *any root): no error")
-	} else if av != any(any(7)) {
-		t.Fatalf("target modified on reject: %s", safeDescValue(av))
+	if err := gbon.Unmarshal(ab, &av); err != nil {
+		t.Fatalf("Unmarshal(nil *any root): %v", err)
+	}
+	if av == nil {
+		t.Fatalf("nil *any root: want typed nil, got nil interface")
+	}
+	got, ok := av.(*any)
+	if !ok || got != nil {
+		t.Fatalf("nil *any root: want (*any)(nil), got %#v", av)
+	}
+	if !bytes.Equal(mustMarshal(t, av), ab) {
+		t.Fatalf("nil *any root: re-encode drift")
+	}
+	type localAnyPtr *any
+	var lp localAnyPtr
+	lb, err := gbon.Marshal(lp)
+	if err != nil {
+		t.Fatalf("Marshal(nil named chain): %v", err)
+	}
+	var av2 any = 7
+	err = gbon.Unmarshal(lb, &av2)
+	if !errors.Is(err, gbon.ErrFormat) {
+		t.Fatalf("named nil root: err = %v, want ErrFormat", err)
+	}
+	var ge *gbon.Error
+	if !errors.As(err, &ge) || ge.Class() != "unknown_name" {
+		t.Fatalf("named nil root: want unknown_name, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "interface concrete type not registered: use Decoder.Register") {
+		t.Fatalf("named nil root: verbatim hint expected, got %v", err)
+	}
+	if av2 != any(any(7)) {
+		t.Fatalf("target modified on reject: %s", safeDescValue(av2))
 	}
 }
 

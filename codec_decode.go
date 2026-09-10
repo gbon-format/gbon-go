@@ -294,6 +294,10 @@ func codecUnmarshal(data []byte, v any) (err error) {
 		return d.decodeRootPointer(pd, target, func(f func()) { rootRestore = f })
 	}
 	if err := matchRootDesc(desc, target.Type(), nil); err != nil {
+		gapped, gerr := d.decodeRootGap(pd, target, nil)
+		if gapped {
+			return gerr
+		}
 		return d.fail(withOffset(err, int(d.r.Pos())))
 	}
 	// Root staging (decode atomicity): the whole value decodes into a
@@ -314,6 +318,36 @@ func matchRootDesc(desc *wire.Desc, t reflect.Type, naming nameOverride) error {
 		return nil
 	}
 	return matchDescNamed(desc, t, naming)
+}
+
+// decodeRootGap decodes a root whose target sits pointer levels deeper
+// than the stream's root grain: the value materializes at the
+// descriptor's grain, then wraps in synthetic unregistered boxes.
+func (d *codecDecoder) decodeRootGap(pd *wire.Desc, target reflect.Value, naming nameOverride) (bool, error) {
+	t := target.Type()
+	k := 0
+	for {
+		if matchDescNamed(pd, t, naming) == nil {
+			tmp := reflect.New(t).Elem()
+			if err := d.decodeBody(pd, tmp, pathNode{idx: -1}); err != nil {
+				return true, d.fail(withOffset(err, int(d.r.Pos())))
+			}
+			v := tmp
+			for range k {
+				box := reflect.New(v.Type())
+				box.Elem().Set(v)
+				v = box
+			}
+			target.Set(v)
+			return true, nil
+		}
+		if t.Kind() != reflect.Pointer {
+			break
+		}
+		t = t.Elem()
+		k++
+	}
+	return false, nil
 }
 
 // derefNamed walks a NAMED-wrapper chain ed -> Refs[0] -> ... down to
@@ -380,6 +414,19 @@ func (d *codecDecoder) decodeRootPointer(pd *wire.Desc, target reflect.Value, se
 		}
 		return d.fail(errFormat(classMalformedOp, d.r.Pos(), "", target.Type(), nil, errDetail("nil root pointer cannot dereference into target")))
 	case wire.ClassRef:
+		if id, ok := d.r.PeekRef(); ok {
+			sort, rv := d.r.RecordAt(id)
+			if sort == wire.RecordValue && rv.IsValid() && rv.Type() == reflect.PointerTo(target.Type()) {
+				if _, err := d.r.ReadRef(); err != nil {
+					return d.mapErr(err)
+				}
+				target.Set(rv.Elem())
+				return nil
+			}
+			if refOpensPointee(pd, sort) {
+				return d.decodeRootPointerBody(pd, target, setRestore)
+			}
+		}
 		id, err := d.r.ReadRef()
 		if err != nil {
 			return d.mapErr(err)
@@ -394,17 +441,24 @@ func (d *codecDecoder) decodeRootPointer(pd *wire.Desc, target reflect.Value, se
 		target.Set(pv.Elem())
 		return nil
 	default:
-		if err := matchDescNamed(pd.Refs[0], target.Type(), d.naming()); err != nil {
-			return d.fail(withOffset(err, int(d.r.Pos())))
-		}
-		snap := reflect.New(target.Type()).Elem()
-		snap.Set(target)
-		setRestore(func() { target.Set(snap) })
-		if target.Type().Size() != 0 {
-			d.r.RegisterValue(target.Addr())
-		}
-		return d.decodeBody(pd.Refs[0], target, pathNode{idx: -1})
+		return d.decodeRootPointerBody(pd, target, setRestore)
 	}
+}
+
+// decodeRootPointerBody materializes the root cell in place; the cell
+// registers before the body decodes, so every REF-to-root inside the
+// value resolves to the caller's storage.
+func (d *codecDecoder) decodeRootPointerBody(pd *wire.Desc, target reflect.Value, setRestore func(func())) error {
+	if err := matchDescNamed(pd.Refs[0], target.Type(), d.naming()); err != nil {
+		return d.fail(withOffset(err, int(d.r.Pos())))
+	}
+	snap := reflect.New(target.Type()).Elem()
+	snap.Set(target)
+	setRestore(func() { target.Set(snap) })
+	if target.Type().Size() != 0 {
+		d.r.RegisterValue(target.Addr())
+	}
+	return d.decodeBody(pd.Refs[0], target, pathNode{idx: -1})
 }
 
 // rootDerefApplies reports whether the R1 root-unwrap branch covers the
@@ -453,6 +507,14 @@ func (d *codecDecoder) decodeSub(v any) error {
 		return d.broken
 	}
 	if err := matchRootDesc(cd, target.Type(), d.naming()); err != nil {
+		gapped, gerr := d.decodeRootGap(cd, target, d.naming())
+		if gapped {
+			if gerr != nil {
+				d.broken = gerr
+				return gerr
+			}
+			return nil
+		}
 		err = d.fail(withOffset(err, int(d.r.Pos())))
 		d.broken = err
 		return err
@@ -570,6 +632,16 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 		return nil
 	}
 	if err := matchRootDesc(desc, target.Type(), namingOf(d.asName)); err != nil {
+		gapped, gerr := dec.decodeRootGap(pd, target, namingOf(d.asName))
+		if gapped {
+			if gerr != nil {
+				d.broken = gerr
+				return gerr
+			}
+			d.sawValue = true
+			d.r.Discard()
+			return nil
+		}
 		err = dec.fail(withOffset(err, int(d.r.Pos())))
 		d.broken = err
 		return err
@@ -899,7 +971,7 @@ func (d *codecDecoder) resolveConcrete(cd *wire.Desc, target reflect.Value, p pa
 	}
 	rt, ok := d.reg[cd.Name]
 	if !ok {
-		return d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail("interface concrete type not registered: use Decoder.Register")))
+		return d.fail(d.resolveDerived(cd, target, p))
 	}
 	if err := matchDescNamed(cd, rt, d.naming()); err != nil {
 		return d.fail(withOffset(err, int(d.r.Pos())))
@@ -908,6 +980,28 @@ func (d *codecDecoder) resolveConcrete(cd *wire.Desc, target reflect.Value, p pa
 		return errUnsupported(classContractMismatch, "", nil, nil, errDetail(fmt.Sprintf("registered type %s does not implement %s", rt, st)))
 	}
 	cv := reflect.New(rt).Elem()
+	if err := d.decodeBody(cd, cv, p); err != nil {
+		return err
+	}
+	target.Set(cv)
+	return nil
+}
+
+// resolveDerived materializes a registry miss through the unnamed
+// iface-pointer grammar; everything outside the grammar stays the loud
+// unknown_name reject.
+func (d *codecDecoder) resolveDerived(cd *wire.Desc, target reflect.Value, p pathNode) error {
+	dt, ok := deriveIfacePtrChain(cd.Name)
+	if !ok {
+		return errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail("interface concrete type not registered: use Decoder.Register"))
+	}
+	if err := match(cd, dt, true, make(map[*wire.Desc]bool), d.naming()); err != nil {
+		return withOffset(err, int(d.r.Pos()))
+	}
+	if st := target.Type(); st.Kind() == reflect.Interface && st.NumMethod() > 0 && !dt.Implements(st) {
+		return errUnsupported(classContractMismatch, "", nil, nil, errDetail(fmt.Sprintf("derived type %s does not implement %s", dt, st)))
+	}
+	cv := reflect.New(dt).Elem()
 	if err := d.decodeBody(cd, cv, p); err != nil {
 		return err
 	}
@@ -1394,8 +1488,8 @@ func keyTypeHasPointer(t reflect.Type) bool {
 	case reflect.Pointer, reflect.Interface:
 		return true
 	case reflect.Struct:
-		for i := 0; i < t.NumField(); i++ {
-			if keyTypeHasPointer(t.Field(i).Type) {
+		for field := range t.Fields() {
+			if keyTypeHasPointer(field.Type) {
 				return true
 			}
 		}
@@ -1465,8 +1559,8 @@ func keyHasNaNDeep(k reflect.Value) bool {
 				return visit(v.Elem())
 			}
 		case reflect.Struct:
-			for i := 0; i < v.NumField(); i++ {
-				if visit(v.Field(i)) {
+			for _, field := range v.Fields() {
+				if visit(field) {
 					return true
 				}
 			}
@@ -1493,8 +1587,8 @@ func keyHashableDeep(k reflect.Value) bool {
 	case reflect.Slice, reflect.Map, reflect.Func, reflect.Chan, reflect.UnsafePointer:
 		return false
 	case reflect.Struct:
-		for i := 0; i < k.NumField(); i++ {
-			if !keyHashableDeep(k.Field(i)) {
+		for _, field := range k.Fields() {
+			if !keyHashableDeep(field) {
 				return false
 			}
 		}
@@ -2088,10 +2182,7 @@ func (d *codecDecoder) skipValue(desc *wire.Desc, path string) error {
 			}
 			return nil
 		case wire.ClassRef:
-			if _, err := d.r.ReadRef(); err != nil {
-				return d.mapErr(err)
-			}
-			return nil
+			return d.skipPointerRef(desc, path)
 		default:
 			// placeholder object record: keeps the id space aligned so
 			// cycle REFs inside the skipped body resolve;
@@ -2170,204 +2261,219 @@ func (d *codecDecoder) skipStringToken(path string) error {
 	return d.checkBytesStr(path)
 }
 
-// decodePointer reconstructs a pointer: nil selector, REF to an already
-// reconstructed target, or a fresh allocation registered before its children
-// decode (two-phase; cycles close through the registered id).
-func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pathNode) error {
-	if desc.Refs[0].Kind == wire.KindInterface {
-		return d.decodePtrToIface(desc, target, p)
+// skipPointerRef skips a pointer body opening with a REF: whole-value
+// backrefs consume one token; otherwise the REF opens the pointee body
+// behind a silent cell reservation.
+func (d *codecDecoder) skipPointerRef(desc *wire.Desc, path string) error {
+	id, ok := d.r.PeekRef()
+	if !ok {
+		if _, err := d.r.ReadRef(); err != nil {
+			return d.mapErr(err)
+		}
+		return nil
 	}
-	if ptrChainToIface(desc, target) {
-		return d.decodePtrChainToIface(desc, target, p)
+	sort, rv := d.r.RecordAt(id)
+	pd, _, pok := derefNamed(desc.Refs[0])
+	if pok {
+		if dp, ok := descPtrDepth(desc); ok && sort == wire.RecordValue && rv.IsValid() && ptrDepth(rv.Type()) == dp {
+			if _, err := d.r.ReadRef(); err != nil {
+				return d.mapErr(err)
+			}
+			return nil
+		}
+		if (sort == wire.RecordDesc && pd.Kind == wire.KindInterface) ||
+			(sort == wire.RecordValue && pd.Kind == wire.KindPointer) {
+			if !descZeroSize(desc.Refs[0], 0) {
+				d.r.RegisterValue(reflect.Value{})
+			}
+			return d.skipValue(pd, path)
+		}
+		if sort == wire.RecordMap && pd.Kind == wire.KindMap {
+			if !descZeroSize(desc.Refs[0], 0) {
+				d.r.RegisterValue(reflect.Value{})
+			}
+			if _, err := d.r.ReadRef(); err != nil {
+				return d.mapErr(err)
+			}
+			return nil
+		}
 	}
-	class, err := d.r.PeekClass()
-	if err != nil {
+	if _, err := d.r.ReadRef(); err != nil {
 		return d.mapErr(err)
 	}
-	switch class {
-	case wire.ClassNil:
-		if k, err := d.r.ReadNil(); err != nil {
-			return d.mapErr(err)
-		} else if k != wire.NilPointer {
-			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("nil selector %d for pointer", k))))
+	return nil
+}
+
+// ptrDepth counts the leading pointer levels of a Go type.
+func ptrDepth(t reflect.Type) int {
+	n := 0
+	for t.Kind() == reflect.Pointer {
+		n++
+		t = t.Elem()
+	}
+	return n
+}
+
+// descPtrDepth counts the pointer levels of a descriptor chain; false on
+// a degenerate NAMED or pointer cycle.
+func descPtrDepth(desc *wire.Desc) (int, bool) {
+	n := 0
+	seen := make(map[*wire.Desc]bool)
+	d := desc
+	for {
+		nd, _, ok := derefNamed(d)
+		if !ok {
+			return 0, false
 		}
-		target.Set(reflect.Zero(target.Type()))
-		return nil
-	case wire.ClassRef:
-		id, err := d.r.ReadRef()
-		if err != nil {
-			return d.mapErr(err)
+		if nd.Kind != wire.KindPointer {
+			return n, true
 		}
-		pv, err := d.r.ValueAt(id)
-		if err != nil {
-			return d.mapErr(err)
+		if seen[nd] {
+			return 0, false
 		}
-		if !pv.IsValid() || pv.Type() != target.Type() {
-			return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not a %s target", id, target.Type()))))
-		}
-		target.Set(pv)
-		return nil
-	default:
-		pv := reflect.New(target.Type().Elem())
-		// zero-size targets are not tracked: the encoder reserves
-		// no id for them, so the decoder registers none — mirroring keeps
-		// subsequent REF ids aligned
-		if target.Type().Elem().Size() != 0 {
-			d.r.RegisterValue(pv)
-		}
-		if err := d.decodeBody(desc.Refs[0], pv.Elem(), p); err != nil {
-			return err
-		}
-		target.Set(pv)
-		return nil
+		seen[nd] = true
+		n++
+		d = nd.Refs[0]
 	}
 }
 
-// decodePtrToIface reconstructs a pointer to an interface pointee. A leading REF
-// is the dynamic-type tag (descriptor) or the cycle ref (object); a leading nil
-// selector marks the nil pointer or the nil-interface pointee.
-func (d *codecDecoder) decodePtrToIface(desc *wire.Desc, target reflect.Value, p pathNode) error {
+// decodePointer reconstructs a pointer cell: the wire body carries the
+// pointee's tokens and the cell is silent; a leading REF or nil selector
+// is the pointee's unless it names a value cell of the slot's own type.
+func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pathNode) error {
 	class, err := d.r.PeekClass()
 	if err != nil {
 		return d.mapErr(err)
 	}
 	switch class {
 	case wire.ClassNil:
-		k, err := d.r.ReadNil()
-		if err != nil {
-			return d.mapErr(err)
-		}
-		if k == wire.NilPointer {
+		if k, ok := d.r.PeekNilKind(); ok && k == wire.NilPointer {
+			if _, err := d.r.ReadNil(); err != nil {
+				return d.mapErr(err)
+			}
 			target.Set(reflect.Zero(target.Type()))
 			return nil
 		}
-		if k != wire.NilInterface {
-			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("nil selector %d for pointer to interface", k))))
-		}
-		pv := reflect.New(target.Type().Elem())
-		if target.Type().Elem().Size() != 0 {
-			d.r.RegisterValue(pv)
-		}
-		target.Set(pv)
-		return nil
+		return d.decodePointerCell(desc, target, p)
 	case wire.ClassRef:
-		id, err := d.r.ReadRef()
-		if err != nil {
-			return d.mapErr(err)
-		}
-		if pv, err := d.r.ValueAt(id); err == nil {
-			if !pv.IsValid() || pv.Type() != target.Type() {
-				return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not a %s target", id, target.Type()))))
-			}
-			target.Set(pv)
-			return nil
-		}
-		cd, err := d.r.DescAt(id)
-		if err != nil {
-			return d.mapErr(err)
-		}
-		pv := reflect.New(target.Type().Elem())
-		if target.Type().Elem().Size() != 0 {
-			d.r.RegisterValue(pv)
-		}
-		if err := d.resolveConcrete(cd, pv.Elem(), p); err != nil {
+		handled, err := d.pointerBackref(desc, target, p)
+		if handled || err != nil {
 			return err
 		}
-		target.Set(pv)
-		return nil
+		return d.decodePointerCell(desc, target, p)
 	default:
-		pv := reflect.New(target.Type().Elem())
-		if target.Type().Elem().Size() != 0 {
-			d.r.RegisterValue(pv)
-		}
-		if err := d.decodeBody(desc.Refs[0], pv.Elem(), p); err != nil {
-			return err
-		}
-		target.Set(pv)
-		return nil
+		return d.decodePointerCell(desc, target, p)
 	}
 }
 
-// ptrChainToIface reports a pointer chain of at least two levels whose
-// descriptor chain and target type chain are equally long and end at an
-// interface; any mismatch keeps the generic path.
-func ptrChainToIface(desc *wire.Desc, target reflect.Value) bool {
-	if desc.Refs[0].Kind != wire.KindPointer {
+// pointerBackref consumes a whole-value REF to a value cell of the
+// slot's own pointer type; false means the REF opens the pointee body
+// (fresh cell) or the record is incompatible (loud family below).
+func (d *codecDecoder) pointerBackref(desc *wire.Desc, target reflect.Value, p pathNode) (bool, error) {
+	id, ok := d.r.PeekRef()
+	if !ok {
+		return false, nil
+	}
+	sort, rv := d.r.RecordAt(id)
+	if sort == wire.RecordValue && rv.IsValid() && rv.Type() == target.Type() {
+		if _, err := d.r.ReadRef(); err != nil {
+			return false, d.mapErr(err)
+		}
+		target.Set(rv)
+		return true, nil
+	}
+	if sort == wire.RecordValue && rv.IsValid() && rv.Type() != target.Type() {
+		// a value cell of exactly the pointee's type names the pointee:
+		// the wrapper cell materializes and the inner decode resolves
+		// this REF as the pointee's whole-value backref
+		if rv.Type() == target.Type().Elem() {
+			return false, nil
+		}
+		if av, ok := interiorOffsetZero(rv, target.Type()); ok {
+			if _, err := d.r.ReadRef(); err != nil {
+				return false, d.mapErr(err)
+			}
+			target.Set(av)
+			return true, nil
+		}
+	}
+	if refOpensPointee(desc, sort) {
+		return false, nil
+	}
+	if _, err := d.r.ReadRef(); err != nil {
+		return false, d.mapErr(err)
+	}
+	pv, err := d.r.ValueAt(id)
+	if err != nil {
+		return false, d.mapErr(err)
+	}
+	if !pv.IsValid() || pv.Type() != target.Type() {
+		return false, d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not a %s target", id, target.Type()))))
+	}
+	target.Set(pv)
+	return true, nil
+}
+
+// refOpensPointee reports whether a REF of this record sort can open
+// the pointee body: iface points and pointer chains open with a
+// descriptor ref, maps with a map ref, plain pointers with a value cell.
+func refOpensPointee(desc *wire.Desc, sort wire.RecordKind) bool {
+	pd, _, ok := derefNamed(desc.Refs[0])
+	if !ok {
 		return false
 	}
-	t := target.Type()
-	for t.Kind() == reflect.Pointer && desc.Refs[0].Kind == wire.KindPointer {
-		t = t.Elem()
-		desc = desc.Refs[0]
+	switch pd.Kind {
+	case wire.KindInterface:
+		return sort == wire.RecordDesc
+	case wire.KindPointer:
+		return sort == wire.RecordValue || sort == wire.RecordDesc
+	case wire.KindMap:
+		return sort == wire.RecordMap
+	case wire.KindString:
+		return sort == wire.RecordString
 	}
-	return t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Interface &&
-		desc.Kind == wire.KindPointer && desc.Refs[0].Kind == wire.KindInterface
+	return false
 }
 
-// decodePtrChainToIface decodes a pointer chain of depth ≥2 with an
-// interface leaf: one leading token carries the whole chain's state —
-// nil selector, sort-disambiguated REF, or the fresh DESC literal tag.
-func (d *codecDecoder) decodePtrChainToIface(desc *wire.Desc, target reflect.Value, p pathNode) error {
-	class, err := d.r.PeekClass()
-	if err != nil {
-		return d.mapErr(err)
+// interiorOffsetZero resolves a REF whose storage the encoder interned
+// by address: a pointer to a struct's first field shares the cell
+// address, so the slot denotes the offset-zero l-value's address.
+func interiorOffsetZero(rv reflect.Value, t reflect.Type) (reflect.Value, bool) {
+	if rv.Kind() != reflect.Pointer || t.Kind() != reflect.Pointer {
+		return reflect.Value{}, false
 	}
-	switch class {
-	case wire.ClassNil:
-		k, err := d.r.ReadNil()
-		if err != nil {
-			return d.mapErr(err)
+	st := rv.Type().Elem()
+	v := rv.Elem()
+	for st.Kind() == reflect.Struct && v.Kind() == reflect.Struct {
+		if st.NumField() == 0 {
+			return reflect.Value{}, false
 		}
-		if k == wire.NilPointer {
-			target.Set(reflect.Zero(target.Type()))
-			return nil
+		if st.Field(0).Name == "_" {
+			return reflect.Value{}, false
 		}
-		if k != wire.NilInterface {
-			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("nil selector %d for pointer", k))))
-		}
-		slot := d.materializePtrChain(target)
-		slot.Set(reflect.Zero(slot.Type()))
-		return nil
-	case wire.ClassRef:
-		id, err := d.r.ReadRef()
-		if err != nil {
-			return d.mapErr(err)
-		}
-		if pv, err := d.r.ValueAt(id); err == nil {
-			if !pv.IsValid() || pv.Type() != target.Type() {
-				return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not a %s target", id, target.Type()))))
+		f := v.Field(0)
+		if f.Type() == t.Elem() {
+			if !f.CanAddr() {
+				return reflect.Value{}, false
 			}
-			target.Set(pv)
-			return nil
+			return f.Addr(), true
 		}
-		cd, err := d.r.DescAt(id)
-		if err != nil {
-			return d.mapErr(err)
-		}
-		slot := d.materializePtrChain(target)
-		return d.resolveConcrete(cd, slot, p)
-	default:
-		slot := d.materializePtrChain(target)
-		leaf := desc
-		for leaf.Refs[0].Kind == wire.KindPointer {
-			leaf = leaf.Refs[0]
-		}
-		return d.decodeBody(leaf.Refs[0], slot, p)
+		st, v = f.Type(), f
 	}
+	return reflect.Value{}, false
 }
 
-// materializePtrChain allocates and registers the non-nil chain level by
-// level, outermost first — the encoder reserves each level's id on entry,
-// before descending — and returns the interface slot at the leaf.
-func (d *codecDecoder) materializePtrChain(target reflect.Value) reflect.Value {
-	slot := target
-	for slot.Type().Kind() != reflect.Interface {
-		pv := reflect.New(slot.Type().Elem())
-		if pv.Type().Elem().Size() != 0 {
-			d.r.RegisterValue(pv)
-		}
-		slot.Set(pv)
-		slot = pv.Elem()
+// decodePointerCell materializes a fresh cell registered before its
+// pointee decodes (two-phase; cycles close through the id); zero-size
+// targets mirror the encoder and reserve nothing.
+func (d *codecDecoder) decodePointerCell(desc *wire.Desc, target reflect.Value, p pathNode) error {
+	pv := reflect.New(target.Type().Elem())
+	if target.Type().Elem().Size() != 0 {
+		d.r.RegisterValue(pv)
 	}
-	return slot
+	if err := d.decodeBody(desc.Refs[0], pv.Elem(), p); err != nil {
+		return err
+	}
+	target.Set(pv)
+	return nil
 }

@@ -313,18 +313,24 @@ func TestPtrChainIfaceNegatives(t *testing.T) {
 		}
 	}
 
-	// chain cycle via plain Unmarshal — registry contract
+	// chain cycle via plain Unmarshal — derivable pointer chain closes
 	var x any
 	p1 := &x
 	x = p1
+	orig := mustMarshal(t, x)
 	var out3 any
-	err = gbon.Unmarshal(mustMarshal(t, x), &out3)
-	if !errors.Is(err, gbon.ErrFormat) {
-		t.Fatalf("(c): want ErrFormat, got %v", err)
+	if err := gbon.Unmarshal(orig, &out3); err != nil {
+		t.Fatalf("(c): %v", err)
 	}
-	var ce *gbon.Error
-	if !errors.As(err, &ce) || ce.Class() != "unknown_name" {
-		t.Fatalf("(c): want class unknown_name, got %v", err)
+	got, ok := out3.(*any)
+	if !ok {
+		t.Fatalf("(c): want dynamic type *any, got %T", out3)
+	}
+	if *got != out3 {
+		t.Fatalf("(c): cycle must close on the decoded slot")
+	}
+	if !bytes.Equal(mustMarshal(t, out3), orig) {
+		t.Fatalf("(c): re-encode must be byte-identical")
 	}
 
 	// REF to an object of a different pointer type
@@ -369,8 +375,8 @@ func TestPtrChainIfaceNegatives(t *testing.T) {
 	if !errors.As(err, &ee) || ee.Class() != "bad_ref" {
 		t.Fatalf("(e): want class bad_ref, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "is not a descriptor") {
-		t.Fatalf("(e): want the descriptor-sort text, got %v", err)
+	if !strings.Contains(err.Error(), "is not an object record") {
+		t.Fatalf("(e): want the object-record text, got %v", err)
 	}
 
 	// self-referential tag chain: depth budget fires, never a hang

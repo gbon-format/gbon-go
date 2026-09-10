@@ -80,7 +80,7 @@ func TestRegisterValueValueAt(t *testing.T) {
 	}
 }
 
-func TestDescAt(t *testing.T) {
+func TestInternRecordSortAt(t *testing.T) {
 	// DESC literal (interface kind, empty name) registers the descriptor
 	// at id 0 before its name string.
 	r := NewReader([]byte{0xD6, 0x60})
@@ -91,25 +91,21 @@ func TestDescAt(t *testing.T) {
 	if desc.Kind != KindInterface {
 		t.Fatalf("kind = %d, want interface", desc.Kind)
 	}
-	got, err := r.DescAt(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != desc {
-		t.Fatalf("DescAt(0) = %v, want the read descriptor", got)
+	if kind, _ := r.RecordAt(0); kind != RecordDesc {
+		t.Fatalf("RecordAt(0) sort = %d, want descriptor record", kind)
 	}
 	// negative: id of an object record
 	r2 := NewReader(nil)
 	if id := r2.RegisterValue(reflect.ValueOf(42)); id != 0 {
 		t.Fatalf("id = %d", id)
 	}
-	if _, err := r2.DescAt(0); !errors.Is(err, ErrFormat) {
-		t.Fatalf("object entry: want ErrFormat, got %v", err)
+	if kind, v := r2.RecordAt(0); kind != RecordValue || v.Interface() != 42 {
+		t.Fatalf("object entry: sort %d value %v, want value record 42", kind, v)
 	}
 	// negative: unregistered id
 	r3 := NewReader(nil)
-	if _, err := r3.DescAt(7); !errors.Is(err, ErrFormat) {
-		t.Fatalf("unregistered: want ErrFormat, got %v", err)
+	if kind, v := r3.RecordAt(7); kind != RecordOther || v.IsValid() {
+		t.Fatalf("unregistered: sort %d, want other with no value", kind)
 	}
 }
 

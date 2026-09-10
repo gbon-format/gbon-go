@@ -10,11 +10,19 @@
 // interfaces. The per-Decoder registry includes the basic Go types and
 // composites ([]any, map[string]any, []string, []int64, map[string]string)
 // by default; other concrete types are registered through Decoder.Register
-// or bound to a wire name through Decoder.RegisterAs. Functions, channels,
+// or bound to a wire name through Decoder.RegisterAs. Unnamed pointer
+// chains to an interface point (with one slice or map[string] level over
+// the chain) derive from their descriptor name on a registry miss, in
+// both Decoder and stateless Unmarshal scopes. Functions, channels,
 // and unsafe pointers are rejected with a typed error naming the offending
 // field.
 //
 // Round trips preserve cycles and sharing across every reference kind.
+// Identity is cell identity: every reference-worthy record — object,
+// map, or descriptor — interns in one per-stream space, references are
+// type-erased handles, and the type lives on the cell, so a slot of any
+// pointer depth resolves through the same space and the decoded graph
+// re-encodes byte-for-byte.
 // Pointer identity, map identity (a mutation through one reference is
 // visible through every alias), and slice backing-array aliasing: slices
 // whose windows observe shared memory decode as windows over one

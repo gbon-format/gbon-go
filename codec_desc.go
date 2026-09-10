@@ -57,6 +57,45 @@ func nameOf(t reflect.Type) string {
 	return t.String()
 }
 
+// deriveIfacePtrChain reconstructs the unnamed type behind an interface
+// registry-miss name: unnamed pointer chains to an interface point with
+// one optional slice or map[string] level over the chain.
+func deriveIfacePtrChain(name string) (reflect.Type, bool) {
+	// named types keep their qualified names, arrays and non-string-key
+	// maps never parse; an accepted type satisfies nameOf(t) == name.
+	rest := name
+	overSlice, overMap := false, false
+	switch {
+	case strings.HasPrefix(rest, "[]"):
+		overSlice = true
+		rest = rest[2:]
+	case strings.HasPrefix(rest, "map[string]"):
+		overMap = true
+		rest = rest[len("map[string]"):]
+	}
+	if !strings.HasPrefix(rest, "*") {
+		return nil, false
+	}
+	t := reflect.TypeFor[any]()
+	for strings.HasPrefix(rest, "*") {
+		t = reflect.PointerTo(t)
+		rest = rest[1:]
+	}
+	if rest != "interface {}" {
+		return nil, false
+	}
+	if overSlice {
+		t = reflect.SliceOf(t)
+	}
+	if overMap {
+		t = reflect.MapOf(reflect.TypeFor[string](), t)
+	}
+	if nameOf(t) != name {
+		return nil, false
+	}
+	return t, true
+}
+
 // qualifiedName is the name of a defined type outside the standard
 // library: import path + "." + the short t.String() form. Standard
 // library and main packages keep the short form (wire-byte stability for

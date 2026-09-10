@@ -122,6 +122,14 @@ interface values):
 - **Cycles** through pointer, map, slice, and interface positions;
   encoding always terminates within the configured budgets.
 
+Identity is cell identity: every reference-worthy record — an object,
+a map, a descriptor — interns once in a single per-stream space, and a
+reference is a type-erased handle into that space; the type lives on
+the cell, not in the reference. Slots of any pointer depth resolve
+through the one space, so rings close from any entry point — root,
+interface slot, field, element, or map value — and re-encoding
+reproduces the stream byte for byte.
+
 Shared structure is stored once — sharing is compression, and identity
 still holds after the trip. Also carried bit-exact: floats including
 NaN payloads and signed zeros, `complex64`/`complex128`, typed nils
@@ -214,8 +222,16 @@ dec.Register(map[string]any{}, []any{}, string(""), int64(0))
 The registry is strict: binding a name to a different type is an
 error, never a silent overwrite. This is the deliberate price of having
 no global registry — decode of interface values is an explicit,
-inspectable decision. The stateless `Unmarshal` reports `ErrFormat` for
-interface slots; any payload containing `any` needs the streaming path.
+inspectable decision. Unnamed pointer chains to an interface point
+(`*interface {}`, `**interface {}`, …), with one slice or `map[string]`
+level over the chain, are the one family that derives on a registry
+miss: the descriptor name alone fixes the type, so plain `Unmarshal`
+decodes them without any registration. A nil pointer-chain root follows
+the same rule: it decodes as the typed nil of the chain rather than an
+error. Everything else — named types
+above all — still reports `ErrFormat` for interface slots; payloads with
+`any` slots beyond that family need the streaming path or a
+registration.
 
 ## Format properties
 

@@ -8,6 +8,7 @@ import (
 // Kind is a type-descriptor kind; 16 kinds, 16..255 reserved.
 type Kind uint8
 
+// Descriptor kinds.
 const (
 	KindStruct    Kind = 0
 	KindSlice     Kind = 1
