@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Error class `internal_panic` with the `ErrInternal` sentinel and the
+  `Error.Stack()` accessor: a foreign panic recovered at the decode
+  boundary is attributed as an internal defect (panic value in `Got`,
+  bounded stack), never as a budget error. Allocation panics of the
+  make/grow family under raised limits keep the `budget_alloc` class.
+
+### Fixed
+
+- Stream-mode lookahead over the sliding window: a REF token peeked at
+  the `largeRead` compaction boundary could leave a negative cursor
+  (`PeekRef` absolute-position restore raced a mid-token window
+  compact), panicking on the next direct buffer read. Peek now arms a
+  single-token lookahead drained by the next read; the observable
+  position never moves. Releases v0.0.2 and v0.0.3 carry the defect.
+
 ### Changed
 
 - Decoder reference resolution on the cell model: references are

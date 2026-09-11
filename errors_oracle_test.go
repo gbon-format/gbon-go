@@ -62,8 +62,8 @@ func oracleDupStream(key string) []byte {
 }
 
 // oracleCorpus builds one probe per class reachable through the public
-// API. budget_alloc (decode panic recovery) has no craftable public
-// probe: its charges fire before any allocation that could panic.
+// API; budget_alloc and internal_panic (the decode recover tripwire)
+// are probed in the snippet corpus and the never-panic oracle.
 func oracleCorpus(t *testing.T) []oracleCase {
 	t.Helper()
 	mk := func(name, class string, sentinel error, err error, decodeCtx, hasPath bool, payload ...string) oracleCase {

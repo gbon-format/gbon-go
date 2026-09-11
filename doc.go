@@ -94,16 +94,20 @@
 // Errors are a contract of structure, not text: diagnostic messages are
 // rendering and may change between releases, while the stable surface is the class ID (Error.Class, snake_case),
 // the sentinel family (errors.Is against ErrFormat, ErrBudget,
-// ErrUnsupported, ErrIO), and the fields reachable through errors.As
-// into *Error (offset, path, got, want, and the cause through Unwrap).
-// The five attribution families map onto the sentinels: data/format to
+// ErrUnsupported, ErrIO, ErrInternal), and the fields reachable through
+// errors.As into *Error (offset, path, got, want, the cause through
+// Unwrap, and the recovered-panic stack through Stack). The six
+// attribution families map onto the sentinels: data/format to
 // ErrFormat, budget to ErrBudget, code and contract to ErrUnsupported,
-// env to ErrIO. Decode errors carry a byte offset; errors with a value
-// location carry a path. A nil or typed-nil reader or writer is rejected
-// with a contract_mismatch error, not a panic, and the rejection is not
-// sticky. Panic containment (the budget_alloc guard) is a decode-side
-// mechanism; the encode path has no recover, so a value that panics during
-// encoding propagates the panic.
+// env to ErrIO, internal to ErrInternal. Decode errors carry a byte
+// offset; errors with a value location carry a path. A nil or typed-nil
+// reader or writer is rejected with a contract_mismatch error, not a
+// panic, and the rejection is not sticky. Panic containment is a
+// decode-side tripwire, forever: an allocation panic of the make/grow
+// family under raised limits maps to budget_alloc; any other panic
+// decodes to internal_panic with the panic value in Got and a bounded
+// stack through Stack. The encode path has no recover, so a value that
+// panics during encoding propagates the panic.
 //
 // The %v form is one line — gbon: <class>, then the path and offset
 // segments when the class carries that context — and the %+v form
@@ -150,6 +154,7 @@
 //	contract_mismatch contract: decode target breaks the evolution contract
 //	io_read           env: underlying reader failed
 //	io_write          env: underlying writer failed
+//	internal_panic    internal: foreign panic recovered by the tripwire
 //
 // classids-end
 package gbon

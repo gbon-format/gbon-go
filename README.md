@@ -306,9 +306,13 @@ diagnostics (`Decoder.SetTrustedInput`) can additionally carry a
 bounded hexdump window of the input around the failure offset, plus a
 machine triple through `Error.Snippet()`. A nil or typed-nil reader or
 writer is rejected with a `contract_mismatch` error, not a panic, and
-the rejection is not sticky. Panic containment (`budget_alloc`) is a
-decode-side guard; the encode side has no recover — a value that
-panics during encoding propagates the panic.
+the rejection is not sticky. Panic containment is a decode-side
+tripwire, forever: an allocation panic of the make/grow family under
+raised limits maps to `budget_alloc`; any other panic decodes to
+`internal_panic` (`ErrInternal`) — an internal defect, not input —
+with the panic value in `Got` and a bounded stack through
+`Error.Stack()`. The encode side has no recover — a value that panics
+during encoding propagates the panic.
 
 ## Wire format and versioning
 

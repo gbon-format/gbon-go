@@ -8,7 +8,7 @@ import (
 )
 
 func TestErrorCoreSmoke(t *testing.T) {
-	sentinels := map[error]bool{ErrFormat: true, ErrBudget: true, ErrUnsupported: true, ErrIO: true}
+	sentinels := map[error]bool{ErrFormat: true, ErrBudget: true, ErrUnsupported: true, ErrIO: true, ErrInternal: true}
 	for class, sentinel := range classSentinels {
 		if !sentinels[sentinel] {
 			t.Fatalf("class %q maps to a non-sentinel", class)

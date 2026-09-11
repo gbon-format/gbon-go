@@ -222,6 +222,14 @@ type Reader struct {
 	// base is the absolute stream offset of buf[0] (stream mode): consumed
 	// bytes are dropped from the window front by compact.
 	base int
+	// pending lookahead (PeekRef): the armed token spans
+	// buf[pendStart:pendStart+pendLen] with peekID its parsed id. The
+	// bytes stay unconsumed while armed (pos does not pass pendStart);
+	// consumption retires the track (releasePending), compact and
+	// readDirect renormalize it.
+	pendStart int
+	pendLen   int
+	peekID    uint64
 	// MaxSliceLen bounds backing length L; 0 disables the budget
 	// at token level; the codec layer applies conservative defaults.
 	MaxSliceLen uint64
@@ -301,14 +309,33 @@ func (r *Reader) fill(n int) error {
 	return nil
 }
 
-// compact drops the consumed prefix of the window.
+// compact drops the consumed prefix of the window. A pending lookahead
+// track is renormalized to the shifted window: the armed bytes move
+// with the buffer, and a track the cursor has already passed expires.
 func (r *Reader) compact() {
+	if r.pendLen > 0 {
+		if r.pos < r.pendStart {
+			r.pendStart -= r.pos
+		} else {
+			r.pendLen = max(r.pendStart+r.pendLen-r.pos, 0)
+			r.pendStart = 0
+		}
+	}
 	r.base += r.pos
 	r.buf = r.buf[r.pos:]
 	if len(r.buf) == 0 {
 		r.buf = nil
 	}
 	r.pos = 0
+}
+
+// releasePending retires the pending lookahead track once consumption
+// has passed the armed token; before that the armed bytes themselves
+// are the next input, so the track stays live.
+func (r *Reader) releasePending() {
+	if r.pendLen > 0 && r.pos >= r.pendStart+r.pendLen {
+		r.pendLen = 0
+	}
 }
 
 // Discard releases the consumed prefix of the window. Calling it at record
@@ -440,6 +467,7 @@ func (r *Reader) byteAt() (byte, error) {
 	}
 	b := r.buf[r.pos]
 	r.pos++
+	r.releasePending()
 	return b, nil
 }
 
@@ -465,6 +493,7 @@ func (r *Reader) readN(n uint64) ([]byte, error) {
 	}
 	b := r.buf[r.pos : r.pos+int(n)]
 	r.pos += int(n)
+	r.releasePending()
 	return b, nil
 }
 
@@ -480,6 +509,7 @@ func (r *Reader) readDirect(n uint64) ([]byte, error) {
 	r.base += r.pos + pending
 	r.buf = nil
 	r.pos = 0
+	r.pendLen = 0
 	for uint64(len(out)) < n {
 		if len(out) == cap(out) {
 			grow := min(cap(out), readDirectMaxGrow)

@@ -163,13 +163,26 @@ func (r *Reader) PeekRef() (uint64, bool) {
 	if class, err := r.peekFirst(); err != nil || class != classRef {
 		return 0, false
 	}
-	abs := r.base + r.pos
-	id, err := r.readTokenArg(classRef)
-	r.pos = abs - r.base
-	if err != nil {
-		return 0, false
+	if r.pendLen == 0 {
+		if r.src != nil {
+			// The lookahead fills exactly the token extent — the header
+			// byte plus the ARG payload width named by its form nibble —
+			// so it never waits for bytes past the token itself (a live
+			// non-EOF source would block forever on an over-read).
+			if err := r.fill(1 + argWidth(r.buf[r.pos]&0x0F)); err != nil {
+				return 0, false
+			}
+		}
+		start := r.pos
+		id, err := r.readTokenArg(classRef)
+		end := r.pos
+		r.pos = start
+		if err != nil {
+			return 0, false
+		}
+		r.pendStart, r.pendLen, r.peekID = start, end-start, id
 	}
-	return id, true
+	return r.peekID, true
 }
 
 // PeekNilKind returns the selector of a NIL-class token at the current

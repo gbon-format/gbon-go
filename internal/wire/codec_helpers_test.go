@@ -3,6 +3,7 @@ package wire
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -138,5 +139,84 @@ func TestMaxDescDepthGuard(t *testing.T) {
 	r2 := NewReader(chain)
 	if _, err := r2.ReadDesc(); !errors.Is(err, ErrFormat) {
 		t.Fatalf("unguarded: want truncation ErrFormat, got %v", err)
+	}
+}
+
+// TestPeekRefWindowBoundary pins the peek-vs-compaction contract at
+// the largeRead boundary: no consumption, no cursor motion, idempotent
+// repeat, and the consuming read matches the buffered-mode reader.
+func TestPeekRefWindowBoundary(t *testing.T) {
+	id := uint64(0xDEADBEEFCAFE) // variable: shifts must not fold into byte constants
+	for _, shift := range []int{-1, 0, 1, 4, 8} {
+		t.Run(fmt.Sprintf("shift%d", shift), func(t *testing.T) {
+			pad := largeRead - 1 + shift
+			var raw []byte
+			raw = append(raw, Magic...)
+			raw = append(raw, Major, Minor)
+			for range pad {
+				raw = append(raw, 0x21) // filler int token
+			}
+			// REF token, u64 ARG form: 9 bytes total.
+			raw = append(raw, classRef<<4|0x0F)
+			raw = append(raw, byte(id>>56), byte(id>>48), byte(id>>40), byte(id>>32),
+				byte(id>>24), byte(id>>16), byte(id>>8), byte(id))
+
+			// Stream mode: consume the header and the padding in
+			// window-sized steps so fills and compacts happen on the
+			// way to the token.
+			sr := NewStreamReader(bytes.NewReader(raw))
+			if _, _, err := sr.ReadHeader(); err != nil {
+				t.Fatalf("header: %v", err)
+			}
+			for sr.pos < pad+6 {
+				step := min(1<<16, pad+6-sr.pos)
+				if _, err := sr.readN(uint64(step)); err != nil {
+					t.Fatalf("pad read: %v", err)
+				}
+			}
+			// Buffered-mode oracle over the same bytes.
+			br := NewReader(raw)
+			if _, _, err := br.ReadHeader(); err != nil {
+				t.Fatalf("header: %v", err)
+			}
+			if _, err := br.readN(uint64(pad)); err != nil {
+				t.Fatalf("pad read: %v", err)
+			}
+			wantID, ok := br.PeekRef()
+			if !ok {
+				t.Fatalf("buffered PeekRef failed")
+			}
+			if wantID != id {
+				t.Fatalf("buffered PeekRef = %#x, want %#x", wantID, id)
+			}
+
+			posBefore := sr.Pos()
+			gotID, ok := sr.PeekRef()
+			if !ok {
+				t.Fatalf("stream PeekRef failed at the boundary")
+			}
+			if gotID != wantID {
+				t.Fatalf("stream PeekRef = %#x, want buffered %#x", gotID, wantID)
+			}
+			if sr.Pos() != posBefore {
+				t.Fatalf("PeekRef moved observable Pos: %d → %d", posBefore, sr.Pos())
+			}
+			if sr.pos < 0 {
+				t.Fatalf("internal cursor negative: %d", sr.pos)
+			}
+			if class, err := sr.peekFirst(); err != nil || class != classRef {
+				t.Fatalf("probe after peek: class %#x err %v", class, err)
+			}
+			if again, _ := sr.PeekRef(); again != wantID {
+				t.Fatalf("repeated PeekRef = %#x, want %#x", again, wantID)
+			}
+			consumed, err := sr.readTokenArg(classRef)
+			if err != nil || consumed != wantID {
+				t.Fatalf("consuming read: %#x err %v, want %#x", consumed, err, wantID)
+			}
+			if !sr.AtEOF() {
+				t.Fatalf("stream not exhausted after the token")
+			}
+		})
 	}
 }

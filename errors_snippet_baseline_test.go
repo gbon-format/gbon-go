@@ -14,9 +14,9 @@ var snippetIdentityBaseline = map[string][2]string{
 	"bad_view": {"gbon: bad_view (offset 30): wire: view off+cap=6 exceeds backing L=2",
 		"gbon: bad_view (offset 30): wire: view off+cap=6 exceeds backing L=2\n    class = bad_view\n    offset = 30\n    cause = wire: view off+cap=6 exceed" +
 			"s backing L=2"},
-	"budget_alloc": {"gbon: budget_alloc: allocation during decode exceeded limits: SNIPPETALLOCBOOM",
-		"gbon: budget_alloc: allocation during decode exceeded limits: SNIPPETALLOCBOOM\n    class = budget_alloc\n    cause = allocation during decode excee" +
-			"ded limits: SNIPPETALLOCBOOM"},
+	"budget_alloc": {"gbon: budget_alloc: allocation during decode exceeded limits: runtime: allocation size out of range",
+		"gbon: budget_alloc: allocation during decode exceeded limits: runtime: allocation size out of range\n    class = budget_alloc\n    cause = allocatio" +
+			"n during decode exceeded limits: runtime: allocation size out of range"},
 	"budget_bytes": {"gbon: budget_bytes at $ (offset 18): allocation of 100 bytes exceeds MaxBytes budget 32",
 		"gbon: budget_bytes at $ (offset 18): allocation of 100 bytes exceeds MaxBytes budget 32\n    class = budget_bytes\n    offset = 18\n    path = $\n  " +
 			"  want = 32\n    cause = allocation of 100 bytes exceeds MaxBytes budget 32"},
@@ -643,6 +643,9 @@ var snippetIdentityBaseline = map[string][2]string{
 		"gbon: contract_mismatch: Limits.MaxDepth is negative (-1)\n    class = contract_mismatch\n    cause = Limits.MaxDepth is negative (-1)"},
 	"duplicate_key": {"gbon: duplicate_key at $[\"dupkey\"] (offset 52)",
 		"gbon: duplicate_key at $[\"dupkey\"] (offset 52)\n    class = duplicate_key\n    offset = 52\n    path = $[\"dupkey\"]"},
+	"internal_panic": {"gbon: internal_panic: unexpected panic during decode",
+		"gbon: internal_panic: unexpected panic during decode\n    class = internal_panic\n    got = [\"SNIPPETALLOCBOOM\"]\n    cause = unexpected panic dur" +
+			"ing decode"},
 	"io_read":  {"gbon: io_read (offset 0): ORACLEIOFAIL", "gbon: io_read (offset 0): ORACLEIOFAIL\n    class = io_read\n    offset = 0\n    cause = ORACLEIOFAIL"},
 	"io_write": {"gbon: io_write: ORACLEWRITEFAIL", "gbon: io_write: ORACLEWRITEFAIL\n    class = io_write\n    cause = ORACLEWRITEFAIL"},
 	"malformed_arg": {"gbon: malformed_arg (offset 17): wire: non-minimal u8 argument 11",

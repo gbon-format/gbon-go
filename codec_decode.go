@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -253,11 +254,46 @@ func withOffset(err error, off int) error {
 	return err
 }
 
-// allocPanicError converts a decode-time panic into an ErrBudget wrap: a crafted backing
-// length admitted by user-raised limits panics at the allocation; a non-allocation bug
-// surfacing as ErrBudget is a registered limitation; stack exhaustion is prevented by depth budgets.
-func (d *codecDecoder) allocPanicError(p any) error {
-	return d.fail(errBudget(classBudgetAlloc, -1, "", nil, nil, errDetail(fmt.Sprintf("allocation during decode exceeded limits: %v", p))))
+// allocPanicSignatures are the runtime panic phrases of the make/grow
+// family: the allocation panics decode under user-raised limits can
+// legitimately raise when the allocator refuses an admitted length.
+var allocPanicSignatures = []string{
+	"allocation size out of range",
+	"makeslice:",
+	"growslice:",
+}
+
+// isAllocPanic reports whether p is an allocation panic of the make/grow
+// family: a runtime error whose text carries a known signature. String
+// panics never qualify — a look-alike phrase from a coder stays foreign.
+func isAllocPanic(p any) bool {
+	re, ok := p.(runtime.Error)
+	if !ok {
+		return false
+	}
+	msg := re.Error()
+	for _, sig := range allocPanicSignatures {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// panicStackBytes bounds the stack captured onto an internal_panic
+// error (panic branch only; honest errors carry no stack).
+const panicStackBytes = 8 << 10
+
+// recoveredPanicError turns a decode-time panic into a structural
+// error: a make/grow allocation panic stays budget_alloc; any other
+// panic attributes internal_panic (panic value in Got, bounded stack).
+func (d *codecDecoder) recoveredPanicError(p any) error {
+	if isAllocPanic(p) {
+		return d.fail(errBudget(classBudgetAlloc, -1, "", nil, nil, errDetail(fmt.Sprintf("allocation during decode exceeded limits: %v", p))))
+	}
+	stack := make([]byte, panicStackBytes)
+	n := runtime.Stack(stack, false)
+	return &Error{class: classInternalPanic, Offset: -1, Got: p, stack: stack[:n], err: errDetail("unexpected panic during decode")}
 }
 
 // codecUnmarshal decodes one self-contained stream into the value pointed to
@@ -272,7 +308,7 @@ func codecUnmarshal(data []byte, v any) (err error) {
 	var d *codecDecoder
 	defer func() {
 		if p := recover(); p != nil {
-			err = d.allocPanicError(p)
+			err = d.recoveredPanicError(p)
 		}
 		if rootRestore != nil && err != nil {
 			rootRestore()
@@ -605,7 +641,7 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 	var dec *codecDecoder
 	defer func() {
 		if p := recover(); p != nil {
-			err = dec.allocPanicError(p)
+			err = dec.recoveredPanicError(p)
 		}
 		if rootRestore != nil && err != nil {
 			rootRestore()

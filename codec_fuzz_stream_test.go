@@ -3,6 +3,7 @@ package gbon_test
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -50,13 +51,12 @@ func stStreamPlan(seed int64) (n int, forced bool) {
 	return 2 + int(uint64(seed)%39), seed%2 == 0
 }
 
-// stStreamMsg builds message i deterministically from r over the closed
-// class table (map[string]any / stStreamW / stStreamG / []any / string /
-// map[string]int). Both passes (encode, want-regen) drive a fresh rand
-// with the same seed through the same call sequence.
+// stStreamBuild builds message i deterministically from r over the
+// closed class table (see stStreamMsg); the >64 KiB string class makes
+// the window pull, compact, and re-arm across a large record body.
 func stStreamBuild(r *rand.Rand, i int) stStreamMsg {
 	var p any
-	switch r.Intn(6) {
+	switch r.Intn(7) {
 	case 0:
 		p = map[string]any{"k": "v", "j": int64(i)}
 	case 1:
@@ -67,6 +67,10 @@ func stStreamBuild(r *rand.Rand, i int) stStreamMsg {
 		p = stStreamG{Code: "g", Params: map[string]int64{"a": int64(i)}}
 	case 4:
 		p = []any{"l", int64(i), 3.5}
+	case 5:
+		// payload past the fill chunk: the sliding window pulls,
+		// compacts, and re-arms across a >64 KiB record body
+		p = strings.Repeat("x", 1<<16+i%2048)
 	default:
 		p = map[string]int{"m": i}
 	}
@@ -161,7 +165,7 @@ func stStreamCheck(t testing.TB, data []byte) {
 		}
 	}
 
-	dec := gbon.NewDecoder(bytes.NewReader(wire))
+	dec := gbon.NewDecoder(&stStreamChunkReader{b: wire})
 	if err := dec.Register(stStreamW{}, stStreamG{}, map[string]any{},
 		map[string]int{}, []any{}, "", int64(0), 3.5); err != nil {
 		t.Fatalf("register: %v", err)
@@ -253,6 +257,22 @@ func stStreamEq(got, want any) bool {
 	default:
 		return got == want
 	}
+}
+
+// stStreamChunkReader serves the wire in bounded chunks (fill chunk
+// size): the sliding window exercises its pull/compact cycle instead
+// of one bulk Read.
+type stStreamChunkReader struct {
+	b []byte
+}
+
+func (r *stStreamChunkReader) Read(p []byte) (int, error) {
+	if len(r.b) == 0 {
+		return 0, io.EOF
+	}
+	n := min(copy(p, r.b), 1<<16)
+	r.b = r.b[n:]
+	return n, nil
 }
 
 // streamAnchor pins a stream a failure report refers to: total length

@@ -12,9 +12,9 @@ import (
 
 // Sentinel errors of the codec error contract. Every error returned by the
 // public API carries exactly one of them through errors.Is, derived from
-// its class by the class-sentinel table below. The fourth sentinel, ErrIO,
-// attributes a failed read or write on the underlying stream (an
-// environment fault, distinct from malformed data).
+// its class by the class-sentinel table below. The fifth sentinel,
+// ErrInternal, attributes a foreign panic recovered by the decode
+// tripwire (an internal defect, distinct from malformed data).
 var (
 	// ErrUnsupported reports a value of a category that has no serialized
 	// form: func, chan, unsafe.Pointer, or a struct with unexported fields
@@ -33,11 +33,15 @@ var (
 	// was pulling input, or a write while encode was flushing output; the
 	// original fault is reachable through Unwrap.
 	ErrIO = errors.New("gbon: underlying stream read or write failed")
+
+	// ErrInternal reports a foreign panic recovered at the decode
+	// boundary: not input, not budget — an internal defect of the codec.
+	ErrInternal = errors.New("gbon: internal panic during decode")
 )
 
 // Error class IDs — snake_case strings carried by Error.Class. They are a
-// public contract: additive only; IDs are never renamed or reused. Five
-// attribution families: data/format, budget, code, contract, env.
+// public contract: additive only; IDs are never renamed or reused. Six
+// attribution families: data/format, budget, code, contract, env, internal.
 const (
 	classBadMagic         = "bad_magic"
 	classTruncated        = "truncated"
@@ -60,12 +64,14 @@ const (
 	classContractMismatch = "contract_mismatch"
 	classIORead           = "io_read"
 	classIOWrite          = "io_write"
+	classInternalPanic    = "internal_panic"
 )
 
 // classSentinels is the deterministic class-to-sentinel table: data/format
 // classes map to ErrFormat, budget to ErrBudget, code and contract to
-// ErrUnsupported, env (io_read, io_write) to ErrIO. Error.Is answers
-// through this table alone.
+// ErrUnsupported, env (io_read, io_write) to ErrIO, internal
+// (internal_panic) to ErrInternal. Error.Is answers through this table
+// alone.
 var classSentinels = map[string]error{
 	classBadMagic:         ErrFormat,
 	classTruncated:        ErrFormat,
@@ -88,6 +94,7 @@ var classSentinels = map[string]error{
 	classContractMismatch: ErrUnsupported,
 	classIORead:           ErrIO,
 	classIOWrite:          ErrIO,
+	classInternalPanic:    ErrInternal,
 }
 
 // Error is the structured error type returned by the codec: class (the
@@ -110,6 +117,9 @@ type Error struct {
 	snippet    []byte
 	snippetOff int
 	snippetSet bool
+	// Recovered-panic diagnostics (internal_panic): the bounded stack
+	// captured at the recover boundary; honest errors carry none.
+	stack []byte
 }
 
 // ErrorSnippet is the machine-readable form of a captured input window:
@@ -156,6 +166,10 @@ func (e *Error) LogValue() slog.Value {
 
 // Class returns the error class ID (snake_case, public contract).
 func (e *Error) Class() string { return e.class }
+
+// Stack returns the bounded goroutine stack captured with an
+// internal_panic error; nil for every other class.
+func (e *Error) Stack() []byte { return e.stack }
 
 // Unwrap returns the cause (the underlying fault, or the detail phrase for
 // caller-context classes).

@@ -51,6 +51,23 @@ func argForm(n uint64) byte {
 	}
 }
 
+// argWidth is the payload byte count of an ARG form; inline forms carry
+// the value in the selector byte itself.
+func argWidth(form byte) int {
+	switch form {
+	case argU8:
+		return 1
+	case argU16:
+		return 2
+	case argU32:
+		return 4
+	case argU64:
+		return 8
+	default: // inline
+		return 0
+	}
+}
+
 // appendArgBytes appends the big-endian payload of n for the given form;
 // inline forms carry the value in the selector byte itself.
 func appendArgBytes(dst []byte, form byte, n uint64) []byte {

@@ -1,17 +1,19 @@
 package gbon_test
 
 // The crafted corpus behind the identity baseline and the structured-log
-// probes: one public-API probe per error class, all twenty-one classes
+// probes: one public-API probe per error class, all twenty-two classes
 // covered. The eighteen probes of the oracle corpus are reused as-is; the
-// remaining three classes get dedicated probes here (duplicate key
-// stream, a failing custom coder, a panicking custom coder recovered by
-// the decode panic guard).
+// remaining four classes get dedicated probes here (duplicate key
+// stream, a failing custom coder, a crafted allocation bomb under
+// raised limits, and a panicking custom coder attributed by the decode
+// tripwire).
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
 	"go/format"
+	"math"
 	"os"
 	"reflect"
 	"sort"
@@ -29,6 +31,7 @@ var snippetClasses = []string{
 	"budget_depth", "budget_nodes", "budget_bytes", "budget_alloc",
 	"unsupported_kind", "register_conflict", "coder_error", "coder_recursion",
 	"contract_mismatch", "io_read", "io_write",
+	"internal_panic",
 }
 
 type snippetCase struct {
@@ -50,8 +53,8 @@ func (snippetFailCoder) DecodeValue(*gbon.Decoder, reflect.Value) error {
 	return errors.New("SNIPPETCODERFAIL")
 }
 
-// snippetPanicCoder panics inside the decode body; the decode panic guard
-// turns the panic into the allocation class.
+// snippetPanicCoder panics inside the decode body; the decode tripwire
+// attributes the coder's panic to the internal family.
 type snippetPanicBox struct{ N int64 }
 
 type snippetPanicCoder struct{}
@@ -62,6 +65,17 @@ func (snippetPanicCoder) EncodeValue(e *gbon.Encoder, v reflect.Value) error {
 
 func (snippetPanicCoder) DecodeValue(*gbon.Decoder, reflect.Value) error {
 	panic("SNIPPETALLOCBOOM")
+}
+
+// craftedAllocBomb builds a []int8 stream claiming a 2^60-element
+// backing: under raised limits the charge passes and the allocator
+// must refuse the allocation — the craftable budget_alloc probe.
+func craftedAllocBomb() []byte {
+	c := newCraft()
+	c.descPos(dSlice(dInt8))
+	r := c.arrayRec(1<<60, 0)
+	c.view0(r)
+	return c.buf
 }
 
 func snippetCoderStream(t *testing.T, box any, coder gbon.Coder) []byte {
@@ -99,12 +113,18 @@ func snippetCorpus(t *testing.T) []snippetCase {
 	out = append(out, snippetCase{name: "coder_error", class: "coder_error",
 		err: fdec.Decode(&fb)})
 
+	bomb := gbon.NewDecoder(bytes.NewReader(craftedAllocBomb()))
+	bomb.SetLimits(gbon.Limits{MaxBytes: math.MaxInt64, MaxSliceLen: math.MaxInt64})
+	var ab []int8
+	out = append(out, snippetCase{name: "budget_alloc", class: "budget_alloc",
+		err: bomb.Decode(&ab)})
+
 	var pb snippetPanicBox
 	pdec := gbon.NewDecoder(bytes.NewReader(snippetCoderStream(t, snippetPanicBox{N: 7}, snippetPanicCoder{})))
 	if err := pdec.RegisterCoder(snippetPanicBox{}, snippetPanicCoder{}); err != nil {
 		t.Fatalf("RegisterCoder: %v", err)
 	}
-	out = append(out, snippetCase{name: "budget_alloc", class: "budget_alloc",
+	out = append(out, snippetCase{name: "internal_panic", class: "internal_panic",
 		err: pdec.Decode(&pb)})
 
 	seen := map[string]string{}
