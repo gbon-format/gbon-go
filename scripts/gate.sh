@@ -22,11 +22,22 @@ docker volume create gbon-gosumdb >/dev/null 2>&1 || true
 
 # Unprivileged run: the container user matches the host user, so gate
 # artifacts (cover.out, module/build caches) never appear root-owned.
+# In a git worktree `.git` is a pointer file with an absolute path to the
+# main repository's gitdir; the main `.git` is co-mounted at the same
+# absolute path so in-container git resolves it (gate-in-worktree recipe).
+SRC="$(cd "$(dirname "$0")/.." && pwd)"
+EXTRA_MOUNT=""
+if [ -f "$SRC/.git" ]; then
+  MAIN_GIT="$(dirname "$(dirname "$(sed 's/^gitdir: //' "$SRC/.git")")")"
+  EXTRA_MOUNT="-v $MAIN_GIT:$MAIN_GIT"
+fi
+
 docker run --rm \
   -m "$MEMCAP" \
   --user "$(id -u):$(id -g)" \
-  -v "$(cd "$(dirname "$0")/.." && pwd)":/w \
+  -v "$SRC":/w \
   $MOUNT \
+  $EXTRA_MOUNT \
   -v gbon-gomod:/go/pkg/mod \
   -v gbon-gobin:/go/bin \
   -v gbon-gosumdb:/go/pkg/sumdb \

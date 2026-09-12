@@ -105,7 +105,8 @@ func stringMapStream(t *testing.T, m map[string]string) []byte {
 func genericMapStream(t *testing.T, m map[string]any) []byte {
 	t.Helper()
 	e := newCodecEncoder()
-	if err := e.encodeMap(reflect.ValueOf(m), pathNode{idx: -1}); err != nil {
+	pl := e.planFor(reflect.TypeOf(m))
+	if err := e.encodeMap(reflect.ValueOf(m), pathNode{idx: -1}, pl.keyPlan); err != nil {
 		t.Fatalf("generic map stream: %v", err)
 	}
 	return e.w.Bytes()

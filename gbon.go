@@ -61,7 +61,12 @@ type Limits struct {
 // state (intern tables, coder tags), so a single Encoder must be owned by
 // one goroutine; create one Encoder per goroutine or per stream. The coder
 // registry is per-Encoder: there is no global registry. Encode calls on
-// distinct Encoders are safe to run in parallel.
+// distinct Encoders are safe to run in parallel. The intern tables hold no
+// strong references to interned objects: an interned object that dies and
+// is later resurrected from a finalizer encodes under a fresh id on its
+// next encounter — identity across resurrection is outside the intern
+// contract. Strong holds exist only in the grouping arena, whose member
+// backing arrays stay pinned until the stream ends — never past it.
 type Encoder struct {
 	enc *codecEncoder
 	w   io.Writer
@@ -157,7 +162,7 @@ func (e *Encoder) RegisterAs(wireName string, example any) error {
 	if e.reserved[wireName] {
 		return errRegister(fmt.Sprintf("wire name %q is reserved", wireName))
 	}
-	if _, cached := e.enc.structDescs[t]; cached {
+	if _, encoded := e.enc.types[t]; encoded {
 		return errRegister(fmt.Sprintf("type %s already encoded in this stream", t))
 	}
 	if prev, ok := e.enc.asType[wireName]; ok && prev != t {
@@ -171,6 +176,7 @@ func (e *Encoder) RegisterAs(wireName string, example any) error {
 	}
 	e.enc.asName[t] = wireName
 	e.enc.asType[wireName] = t
+	e.enc.bumpScopeEpoch()
 	return nil
 }
 
@@ -294,6 +300,7 @@ func (e *Encoder) RegisterCoder(example any, c Coder) error {
 		e.enc.coders = make(map[reflect.Type]Coder)
 	}
 	e.enc.coders[t] = c
+	e.enc.bumpScopeEpoch()
 	return nil
 }
 
@@ -561,7 +568,17 @@ func (d *Decoder) Register(types ...any) error {
 		}
 		d.reg[name] = t
 	}
+	d.invalidateCoderMemo()
 	return nil
+}
+
+// invalidateCoderMemo drops the per-Reader concrete-coder memo after a
+// registry mutation: a cached miss could otherwise mask a newly
+// registered coder from later values of the same stream.
+func (d *Decoder) invalidateCoderMemo() {
+	if d.dec != nil && d.dec.shr != nil {
+		clear(d.dec.shr.cc)
+	}
 }
 
 // RegisterAs binds wireName to example's type in this Decoder's scope:
@@ -607,6 +624,7 @@ func (d *Decoder) RegisterAs(wireName string, example any) error {
 	}
 	d.reg[wireName] = t
 	d.asName[t] = wireName
+	d.invalidateCoderMemo()
 	return nil
 }
 
@@ -642,6 +660,7 @@ func (d *Decoder) RegisterCoder(example any, c Coder) error {
 		d.coders = make(map[string]coderEntry)
 	}
 	d.coders[name] = coderEntry{typ: t, tc: typeCoder{ck: ckCustom, c: c}}
+	d.invalidateCoderMemo()
 	return nil
 }
 

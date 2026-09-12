@@ -2,7 +2,7 @@
 # only dependency beyond the Go toolchain is golangci-lint (pinned version
 # in scripts/gate-inner.sh) for `make lint`.
 
-.PHONY: build test test-race vet lint cover bench fmt fmt-fix gate
+.PHONY: build test test-race vet lint cover bench fmt fmt-fix gate campaign
 
 build:
 	go build ./...
@@ -37,3 +37,10 @@ fmt-fix:
 # pinned Docker image. Requires Docker.
 gate:
 	./scripts/gate.sh
+
+# Measurement campaign (Docker, same pinned image as the gate): grid
+# metrics, string histogram, phase profiles, interleaved bench campaigns
+# with the benchstat A/A validity control. CAMPAIGN_RESULTS must point at
+# an absolute artifacts directory outside the repository.
+campaign:
+	./scripts/campaign.sh

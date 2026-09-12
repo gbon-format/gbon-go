@@ -84,21 +84,41 @@ type codecDecoder struct {
 	nodes    int
 	maxPairs uint64
 	maxBytes int
-	start    int                          // stream offset where the current value began (MaxBytes)
-	alloc    int                          // charged backing-allocation bytes (derived, booked via chargeAlloc)
-	broken   error                        // sticky error of facade sub-decodes inside coder bodies
-	skel     *skeletonScratch             // reused canonical-key render state (map ordering)
-	flat     map[reflect.Type]*flatLayout // per-value flat-struct layout cache
-	ccCache  map[reflect.Type]*typeCoder  // per-value resolved concreteCoder memo (nil = no coder)
+	start    int        // stream offset where the current value began (MaxBytes)
+	alloc    int        // charged backing-allocation bytes (derived, booked via chargeAlloc)
+	broken   error      // sticky error of facade sub-decodes inside coder bodies
+	shr      *decShared // per-Reader caches: struct plans, coder memo, staging scratch
+}
+
+// decShared is the per-Reader decode cache set: compiled struct plans
+// keyed by (target type, reader-interned descriptor pointer), the coder
+// memo, staging scratch. Value-scoped state stays per-value.
+type decShared struct {
+	plans        map[reflect.Type]*decStructPlan
+	cc           map[reflect.Type]*typeCoder
+	scratch      []primSlot
+	skel         *skeletonScratch
+	built        int  // struct-plan builds (sharing probe)
+	referenceLeg bool // reference-interpreter leg (P3 oracle)
+}
+
+// shared returns the decoder's cache set, allocating a fresh one for
+// self-contained decoders (stateless path: one value, one set).
+func (d *codecDecoder) caches() *decShared {
+	if d.shr == nil {
+		d.shr = &decShared{}
+	}
+	return d.shr
 }
 
 // skelScratch returns the decoder's skeleton render scratch, built on
 // first use.
 func (d *codecDecoder) skelScratch() *skeletonScratch {
-	if d.skel == nil {
-		d.skel = newSkeletonScratch()
+	s := d.caches()
+	if s.skel == nil {
+		s.skel = newSkeletonScratch()
 	}
-	return d.skel
+	return s.skel
 }
 
 // coderEntry is one name-resolved coder: the concrete type to materialize
@@ -130,7 +150,8 @@ func (d *codecDecoder) naming() nameOverride {
 // a fresh table for the single-value stateless path).
 func newBudgetDecoder(r *wire.Reader, eff Limits, reg map[string]reflect.Type,
 	coders map[string]coderEntry, binds *coderBinds, fac *Decoder,
-	shared map[uint64]reflect.Value, asName map[reflect.Type]string) *codecDecoder {
+	shared map[uint64]reflect.Value, asName map[reflect.Type]string,
+	shr *decShared) *codecDecoder {
 	r.MaxDescDepth = eff.MaxDepth
 	r.MaxDescNodes = eff.MaxNodes
 	r.MaxSliceLen = uint64(eff.MaxSliceLen)
@@ -153,6 +174,7 @@ func newBudgetDecoder(r *wire.Reader, eff Limits, reg map[string]reflect.Type,
 		maxPairs: uint64(eff.MaxMapPairs),
 		maxBytes: eff.MaxBytes,
 		start:    r.Pos(),
+		shr:      shr,
 	}
 }
 
@@ -314,7 +336,7 @@ func codecUnmarshal(data []byte, v any) (err error) {
 			rootRestore()
 		}
 	}()
-	d = newBudgetDecoder(wire.NewReader(data), effLimits(Limits{}), newBasicReg(), nil, nil, nil, nil, nil)
+	d = newBudgetDecoder(wire.NewReader(data), effLimits(Limits{}), newBasicReg(), nil, nil, nil, nil, nil, nil)
 	if _, _, err := d.r.ReadHeader(); err != nil {
 		return d.mapErr(err)
 	}
@@ -578,6 +600,7 @@ type codecStreamDecoder struct {
 	binds    *coderBinds
 	fac      *Decoder
 	shared   map[uint64]reflect.Value // stream-scoped materialized backings per record id
+	shr      *decShared               // per-Reader caches: struct plans, coder memo, scratch
 }
 
 // init prepares the stream decoder: the source is wrapped for buffered
@@ -598,6 +621,9 @@ func (d *codecStreamDecoder) init(src io.Reader) error {
 	}
 	if d.shared == nil {
 		d.shared = make(map[uint64]reflect.Value)
+	}
+	if d.shr == nil {
+		d.shr = &decShared{}
 	}
 	if _, _, err := d.r.ReadHeader(); err != nil {
 		return d.mapErrInit(err)
@@ -647,7 +673,7 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 			rootRestore()
 		}
 	}()
-	dec = newBudgetDecoder(d.r, eff, d.reg, d.coders, d.binds, d.fac, d.shared, d.asName)
+	dec = newBudgetDecoder(d.r, eff, d.reg, d.coders, d.binds, d.fac, d.shared, d.asName, d.shr)
 	desc, err := d.r.ReadDesc()
 	if err != nil {
 		d.broken = dec.mapErr(err)
@@ -888,7 +914,8 @@ func (d *codecDecoder) lookupCoderEntry(name string) (coderEntry, bool) {
 // canonical name — a RegisterAs binding renames the stream side only) >
 // adapters.
 func (d *codecDecoder) concreteCoder(t reflect.Type, name string) *typeCoder {
-	if tc, ok := d.ccCache[t]; ok {
+	s := d.caches()
+	if tc, ok := s.cc[t]; ok {
 		return tc
 	}
 	var tc *typeCoder
@@ -905,10 +932,10 @@ func (d *codecDecoder) concreteCoder(t reflect.Type, name string) *typeCoder {
 			tc = &typeCoder{ck: ak}
 		}
 	}
-	if d.ccCache == nil {
-		d.ccCache = make(map[reflect.Type]*typeCoder)
+	if s.cc == nil {
+		s.cc = make(map[reflect.Type]*typeCoder)
 	}
-	d.ccCache[t] = tc
+	s.cc[t] = tc
 	return tc
 }
 
@@ -1756,18 +1783,50 @@ func (d *codecDecoder) decodeMap(desc *wire.Desc, target reflect.Value, p pathNo
 
 // decodeStruct reconstructs field values matched by name: stream
 // fields absent on the target are skipped parse-only; target fields absent
-// from the stream keep their zero value.
+// from the stream keep their zero value. Dispatch runs on the compiled
+// plan of the (descriptor, target type) pair: an all-primitive tape
+// stages on the shared scratch and commits once; composite plans stage
+// in a codec-owned copy with the per-field target slots resolved at plan
+// build. The reference leg (FieldByName resolution per field per value)
+// stays reachable through the referenceLeg switch as the plan-equivalence
+// oracle.
 func (d *codecDecoder) decodeStruct(desc *wire.Desc, target reflect.Value, p pathNode) error {
 	if err := d.r.ReadStructHeader(); err != nil {
 		return d.mapErr(err)
 	}
-	if fl := d.flatLayoutFor(desc, target.Type()); fl != nil {
-		return d.decodeFlatStruct(fl, target, p)
+	if d.caches().referenceLeg {
+		return d.decodeStructReference(desc, target, p)
+	}
+	pl := d.structPlanFor(desc, target.Type())
+	if pl.allPrim {
+		return d.decodeFlatStruct(pl, target, p)
 	}
 	// Decode-into-temp-then-assign (decode atomicity): fields stage in a
 	// codec-owned copy; the single target.Set on success is the commit
 	// point — an error anywhere above leaves the target untouched (the
 	// same discipline the container paths already follow).
+	tmp := reflect.New(target.Type()).Elem()
+	for i := range pl.fields {
+		fp := &pl.fields[i]
+		fn := pathNode{parent: &p, name: fp.name, idx: -1}
+		if fp.idx == nil {
+			if err := d.skipValue(desc.Fields[i].Type, fn.String()); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := d.decodeBody(desc.Fields[i].Type, tmp.FieldByIndex(fp.idx), fn); err != nil {
+			return err
+		}
+	}
+	target.Set(tmp)
+	return nil
+}
+
+// decodeStructReference is the plan-free interpreter leg: per-field
+// FieldByName resolution and staging copy, byte- and budget-identical to
+// the compiled path. Test oracle for plan equivalence (P3).
+func (d *codecDecoder) decodeStructReference(desc *wire.Desc, target reflect.Value, p pathNode) error {
 	tmp := reflect.New(target.Type()).Elem()
 	for _, f := range desc.Fields {
 		fn := pathNode{parent: &p, name: f.Name, idx: -1}
@@ -1790,7 +1849,8 @@ func (d *codecDecoder) decodeStruct(desc *wire.Desc, target reflect.Value, p pat
 type flatFieldKind uint8
 
 const (
-	fkBool flatFieldKind = iota
+	fkNone flatFieldKind = iota
+	fkBool
 	fkInt
 	fkUint
 	fkF32
@@ -1798,59 +1858,52 @@ const (
 	fkString
 )
 
-// flatField is one resolved flat-struct field: the target index path and
-// the primitive read kind.
-type flatField struct {
+// decFieldPlan is one resolved stream-field slot: target index path
+// (nil = skip path), primitive staging kind, target type (fkNone =
+// composite recursion through the interpreter).
+type decFieldPlan struct {
+	name string
 	idx  []int
-	kind flatFieldKind
+	prim flatFieldKind
 	ft   reflect.Type
 }
 
-// flatLayout is the per-(type, descriptor) flat-struct plan: every
-// stream field resolves on the target to a settable primitive field.
-// A nil fields slice is the cached negative result: the pair is not
-// flat-primitive, and repeat visits skip field resolution entirely.
-type flatLayout struct {
-	desc   *wire.Desc
-	fields []flatField
+// decStructPlan is the compiled decode plan of one (descriptor, target
+// type) pair: the field tape with pre-resolved slots; allPrim marks the
+// fully flat tape (one-pass staging, no reflect copy).
+type decStructPlan struct {
+	desc    *wire.Desc
+	fields  []decFieldPlan
+	allPrim bool
 }
 
-// maxFlatFields bounds the staged (stack) flat path.
-const maxFlatFields = 16
-
-// flatLayoutFor resolves the flat-struct plan for (desc, t) or nil when
-// the pair is not flat-primitive (composite fields, NAMED wrappers,
-// missing/unsettable target fields). Cached per target type; a structurally
-// different descriptor rebuilds the entry. Negative results up to
-// maxFlatFields are cached like a plan; wide layouts (> maxFlatFields)
-// resolve nil on every visit without caching.
-func (d *codecDecoder) flatLayoutFor(desc *wire.Desc, t reflect.Type) *flatLayout {
-	if d.flat != nil {
-		if fl, ok := d.flat[t]; ok {
-			if fl.desc == desc {
-				if fl.fields == nil {
-					return nil
-				}
-				return fl
+// structPlanFor resolves the compiled plan for (desc, t) from the
+// Reader's shared cache; a different descriptor for the same type
+// rebuilds the entry (descriptor identity = reader-interned pointer).
+func (d *codecDecoder) structPlanFor(desc *wire.Desc, t reflect.Type) *decStructPlan {
+	s := d.caches()
+	if s.plans != nil {
+		if pl, ok := s.plans[t]; ok {
+			if pl.desc == desc {
+				return pl
 			}
 			// same Go type, different stream descriptor: rebuild
-			delete(d.flat, t)
+			delete(s.plans, t)
 		}
-	} else if len(desc.Fields) > maxFlatFields {
-		return nil
 	}
-	if len(desc.Fields) > maxFlatFields {
-		return nil
-	}
-	fields := make([]flatField, len(desc.Fields))
-	for i, f := range desc.Fields {
-		if f.Type.Kind == wire.KindNamed {
-			return d.cacheFlat(t, desc, nil)
-		}
+	s.built++
+	fields := make([]decFieldPlan, len(desc.Fields))
+	allPrim := true
+	for i := range desc.Fields {
+		f := &desc.Fields[i]
+		fp := &fields[i]
+		fp.name = f.Name
 		sf, ok := t.FieldByName(f.Name)
 		if !ok || sf.PkgPath != "" {
-			return d.cacheFlat(t, desc, nil)
+			allPrim = false
+			continue
 		}
+		fp.idx = sf.Index
 		var kind flatFieldKind
 		switch {
 		case f.Type.Kind == wire.KindBool && sf.Type.Kind() == reflect.Bool:
@@ -1866,36 +1919,37 @@ func (d *codecDecoder) flatLayoutFor(desc *wire.Desc, t reflect.Type) *flatLayou
 		case f.Type.Kind == wire.KindString && sf.Type.Kind() == reflect.String:
 			kind = fkString
 		default:
-			return d.cacheFlat(t, desc, nil)
+			kind = fkNone
 		}
-		fields[i] = flatField{idx: sf.Index, kind: kind, ft: sf.Type}
+		if kind == fkNone {
+			fp.prim = fkNone
+			allPrim = false
+			continue
+		}
+		fp.prim, fp.ft = kind, sf.Type
 	}
-	return d.cacheFlat(t, desc, fields)
+	pl := &decStructPlan{desc: desc, fields: fields, allPrim: allPrim}
+	if s.plans == nil {
+		s.plans = make(map[reflect.Type]*decStructPlan)
+	}
+	s.plans[t] = pl
+	return pl
 }
 
-// cacheFlat stores the plan for (t, desc); a nil fields slice is the
-// negative marker, surfaced to callers as a nil plan.
-func (d *codecDecoder) cacheFlat(t reflect.Type, desc *wire.Desc, fields []flatField) *flatLayout {
-	fl := &flatLayout{desc: desc, fields: fields}
-	if d.flat == nil {
-		d.flat = make(map[reflect.Type]*flatLayout)
-	}
-	d.flat[t] = fl
-	if fields == nil {
-		return nil
-	}
-	return fl
-}
-
-// decodeFlatStruct decodes an all-primitive struct into stack staging
-// and commits to the target only after every field read succeeds — the
+// decodeFlatStruct decodes an all-primitive struct into shared-scratch
+// staging and commits to the target only after every field read succeeds — the
 // atomicity guard of the temp path without the reflect.New staging copy.
 // Budget semantics mirror the per-field decodeBody frames: one node per
 // field, MaxBytes re-check before each read (and after each string).
-func (d *codecDecoder) decodeFlatStruct(fl *flatLayout, target reflect.Value, p pathNode) error {
-	var stage [maxFlatFields]primSlot
-	for j, ff := range fl.fields {
-		fn := pathNode{parent: &p, name: fl.desc.Fields[j].Name, idx: -1}
+func (d *codecDecoder) decodeFlatStruct(pl *decStructPlan, target reflect.Value, p pathNode) error {
+	s := d.caches()
+	if cap(s.scratch) < len(pl.fields) {
+		s.scratch = make([]primSlot, len(pl.fields))
+	}
+	stage := s.scratch[:len(pl.fields)]
+	for j := range pl.fields {
+		ff := &pl.fields[j]
+		fn := pathNode{parent: &p, name: ff.name, idx: -1}
 		if d.depth+1 > d.maxDepth {
 			return d.fail(errBudget(classBudgetDepth, d.r.Pos(), fn.String(), nil, d.maxDepth, errDetail(fmt.Sprintf("value nesting exceeds depth budget MaxDepth=%d", d.maxDepth))))
 		}
@@ -1906,7 +1960,7 @@ func (d *codecDecoder) decodeFlatStruct(fl *flatLayout, target reflect.Value, p 
 		if err := d.checkBytes(fn); err != nil {
 			return err
 		}
-		switch ff.kind {
+		switch ff.prim {
 		case fkBool:
 			b, err := d.r.ReadBool()
 			if err != nil {
@@ -1947,23 +2001,24 @@ func (d *codecDecoder) decodeFlatStruct(fl *flatLayout, target reflect.Value, p 
 			}
 			stage[j].u = math.Float64bits(f)
 		case fkString:
-			s, err := d.r.ReadString()
+			st, err := d.r.ReadString()
 			if err != nil {
 				return d.mapErr(err)
 			}
 			if err := d.checkBytes(fn); err != nil {
 				return err
 			}
-			stage[j].s = s
+			stage[j].s = st
 		}
 	}
 	// Fields absent from the stream but present on the target decode to
 	// their zero value: reset the target before writing staged
 	// fields so stale values from a previous decode do not survive.
 	target.Set(reflect.Zero(target.Type()))
-	for j, ff := range fl.fields {
+	for j := range pl.fields {
+		ff := &pl.fields[j]
 		tf := target.FieldByIndex(ff.idx)
-		switch ff.kind {
+		switch ff.prim {
 		case fkBool:
 			tf.SetBool(stage[j].u != 0)
 		case fkInt:

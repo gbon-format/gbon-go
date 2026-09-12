@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+One optimization program, wire format unchanged throughout: encoded
+output is byte-identical across every change below, while encoding
+allocates less across the corpus, primitive-heavy shapes encode
+faster, and long-lived streams hold far less memory.
+
+- Encoder and decoder compile a type plan once per type (and
+  coder-registration epoch) and the value pass reuses it: the scan
+  walk rides the plan graph, values without sharing sources skip the
+  scan machinery entirely, and all-primitive structs decode through a
+  one-pass staging tape (the flat-struct field cap is removed).
+- Generic-path map encoding sorts key pairs by integer rank cells
+  that mirror each key's skeleton bytes (a reflect walk, no
+  rendering), replacing the per-pair skeleton marshal on the sort
+  path; cells live in a per-encoder reused arena, so the sort
+  allocates per key no longer. The encoder-side skeleton scratch is
+  gone; the decoder keeps its skeleton walk for duplicate-key
+  detection.
+- The writer's per-stream interning table (strings, descriptor names,
+  array and blob identities) is an open hash table with stored
+  hashes: exact membership, growth without re-hashing the strings,
+  and a slot pool retained across resets.
+- The encoder's identity intern tables no longer pin interned
+  objects: entries hold a weak pointer whose liveness is the sole
+  identity authority on lookup, a per-Encode stamp avoids re-checking
+  an object within one call, and an amortized sweep with constant
+  per-insert work evicts dead entries. Long-lived streams stop
+  retaining dead objects; as a profile-dependent trade, one-shot
+  encoding of sharing-heavy graphs pays a small constant overhead
+  (a bimodal encoder variant is a recorded follow-up).
+- The scan arena stores grouped members as structure-of-arrays
+  columns (GC-visible pinned pointers, pointer columns swept on
+  reset, no cross-stream residual references), and primitive emission
+  reads field offsets and element strides compiled into the type
+  plan; nil slices keep their zero-bit distinction. The scan walk and
+  custom coders stay on reflect by design.
+
+### Fixed
+
+- `Encoder.RegisterAs` after the encoder has encoded a value of a
+  non-struct type now rejects (the warm-up gate keys on every encoded
+  type, not only struct descriptors).
+
 ## [0.0.4] - 2026-09-11
 
 ### Added

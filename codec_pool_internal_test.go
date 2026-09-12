@@ -110,13 +110,13 @@ func TestArenaPoolHygiene(t *testing.T) {
 	// (which codecMarshalScoped runs after Get) is the reset point.
 	e := encoderPool.Get().(*codecEncoder)
 	e.resetForPool(nil)
-	if len(e.arena.sVal) != 0 || len(e.arena.comps) != 0 {
+	if len(e.arena.sPin) != 0 || len(e.arena.comps) != 0 {
 		t.Fatalf("arena lengths must be zero after resetForPool: slots=%d comps=%d",
-			len(e.arena.sVal), len(e.arena.comps))
+			len(e.arena.sPin), len(e.arena.comps))
 	}
-	for i, sv := range e.arena.sVal[:cap(e.arena.sVal)] {
-		if sv.IsValid() {
-			t.Fatalf("retained slot value at %d: arena holds the object graph past the pool boundary", i)
+	for i, sp := range e.arena.sPin[:cap(e.arena.sPin)] {
+		if sp != nil {
+			t.Fatalf("retained slot pin at %d: arena holds the object graph past the pool boundary", i)
 		}
 	}
 	encoderPool.Put(e)
@@ -132,7 +132,7 @@ func TestArenaPoolHygiene(t *testing.T) {
 	}
 	e2 := encoderPool.Get().(*codecEncoder)
 	e2.resetForPool(nil)
-	if c := cap(e2.arena.sVal); c > arenaSlotWatermark {
+	if c := cap(e2.arena.sPin); c > arenaSlotWatermark {
 		t.Fatalf("slot arena capacity %d must be truncated to the watermark %d", c, arenaSlotWatermark)
 	}
 	if c := cap(e2.arena.comps); c > arenaCompWatermark {

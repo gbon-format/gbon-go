@@ -46,9 +46,9 @@ func TestEncodeWorkCounterChainBound(t *testing.T) {
 	for _, K := range []int{2048, 4096} {
 		e := runChainModel(t, K)
 		W := e.workProbes + e.workElems
-		units := e.nodes + len(e.arena.sVal)
+		units := e.nodes + len(e.arena.sPin)
 		t.Logf("K=%d W=%d (probes=%d elems=%d) nodes=%d slots=%d units=%d W/units=%.1f hostCache: hits=%d misses=%d rate=%.1f%%",
-			K, W, e.workProbes, e.workElems, e.nodes, len(e.arena.sVal), units, float64(W)/float64(units),
+			K, W, e.workProbes, e.workElems, e.nodes, len(e.arena.sPin), units, float64(W)/float64(units),
 			e.hostHits, e.hostMisses, 100*float64(e.hostHits)/float64(e.hostHits+e.hostMisses))
 		if W > 64*int64(units) {
 			t.Errorf("K=%d: work %d exceeds 64*(nodes+slots)=%d", K, W, 64*int64(units))

@@ -67,7 +67,7 @@ func TestBackingGroupContinuum(t *testing.T) {
 	for gi, c := range comps {
 		windows := make([]span, 0, 1)
 		for m := c.head; m >= 0; m = a.sNext[m] {
-			windows = append(windows, span{a.sPtr[m], a.sPtr[m] + uintptr(a.sVal[m].Cap())*c.es})
+			windows = append(windows, span{a.sPtr[m], a.sPtr[m] + uintptr(a.sCap[m])*c.es})
 		}
 		sort.Slice(windows, func(i, j int) bool { return windows[i].lo < windows[j].lo })
 		lo, hi := windows[0].lo, windows[0].hi
@@ -244,7 +244,7 @@ func groupViewsOf(e *codecEncoder) [][]winGeom {
 		}
 		var ws []winGeom
 		for m := c.head; m >= 0; m = a.sNext[m] {
-			ws = append(ws, winGeom{ptr: a.sPtr[m], send: a.sPtr[m] + uintptr(a.sVal[m].Cap())*c.es, es: c.es, blob: c.blob})
+			ws = append(ws, winGeom{ptr: a.sPtr[m], send: a.sPtr[m] + uintptr(a.sCap[m])*c.es, es: c.es, blob: c.blob})
 		}
 		out = append(out, ws)
 	}

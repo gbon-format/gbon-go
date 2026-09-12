@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"unsafe"
+	"weak"
 
 	"github.com/gbon-format/gbon-go/internal/wire"
 )
@@ -81,15 +84,115 @@ type typeEntry struct {
 	ok bool
 }
 
-// pinnedID is one stream-lifetime identity intern: the intern-space id
-// plus the keyed object itself. A bare-address key is an identity token
-// valid only while the object stays alive; retaining the value pins the
-// address against allocator reuse for as long as the id is resolvable,
-// so a subsequent object landing on a freed slot can never claim an earlier
-// record's identity.
-type pinnedID struct {
+// weakID is one stream-lifetime identity intern: the intern-space id
+// plus a weak handle onto the keyed object. The weak handle is the
+// identity authority on lookup: a hit resolves to the recorded id only
+// while the object is alive (Value() != nil); a hit with a cleared
+// handle is a miss, and the next encounter of that address re-interns
+// under a fresh id. Entries hold no strong reference, so the tables
+// retain the interned graph only as long as the stream's own values
+// do.
+type weakID struct {
 	id uint64
-	v  reflect.Value
+	ep uint64 // encode epoch of the last liveness verification
+	wp weak.Pointer[byte]
+}
+
+// alive resolves a table hit to its id: one Value() probe per distinct
+// object per Encode call — the visited graph stays root-reachable for
+// the whole call, so epoch-stamped entries skip the repeat probe.
+func (e *codecEncoder) alive(k uintptr, ent weakID, table map[uintptr]weakID) (uint64, bool) {
+	if ent.ep != e.encEp {
+		if ent.wp.Value() == nil {
+			return 0, false
+		}
+		ent.ep = e.encEp
+		table[k] = ent
+	}
+	return ent.id, true
+}
+
+// internPtr records a pointer identity under the object address. The
+// weak handle aliases the object through its first byte, so it lives
+// and dies with the whole object.
+func (e *codecEncoder) internPtr(p unsafe.Pointer, id uint64) {
+	e.ptrs[uintptr(p)] = weakID{id: id, ep: e.encEp, wp: weak.Make[byte]((*byte)(p))}
+	e.noteInternInsert()
+}
+
+// internMap records a map identity under the map header address.
+func (e *codecEncoder) internMap(p unsafe.Pointer, id uint64) {
+	e.maps[uintptr(p)] = weakID{id: id, ep: e.encEp, wp: weak.Make[byte]((*byte)(p))}
+	e.noteInternInsert()
+}
+
+// Intern-table eviction: dead entries (weak handle cleared) are swept
+// on a dead-majority liveness sample or when the insert run outgrows
+// the table; sweep timing never affects ids or output bytes.
+const (
+	sweepProbeEvery  = 512
+	sweepProbeSample = 64
+	sweepMaxInserts  = 4096
+)
+
+// noteInternInsert amortizes dead-entry eviction: every 512 inserts a
+// fixed-size sample (half per table) is probed — a dead majority
+// sweeps — and an insert run reaching the table size sweeps too.
+func (e *codecEncoder) noteInternInsert() {
+	e.inserts++
+	if e.inserts%sweepProbeEvery != 0 {
+		return
+	}
+	if e.inserts >= sweepMaxInserts && e.inserts >= uint64(len(e.ptrs)+len(e.maps)) {
+		e.sweepDeadInterns()
+		return
+	}
+	dead, live := 0, 0
+	n := 0
+	for _, ent := range e.ptrs {
+		if n == sweepProbeSample/2 {
+			break
+		}
+		n++
+		e.probeWork++
+		if ent.wp.Value() == nil {
+			dead++
+		} else {
+			live++
+		}
+	}
+	n = 0
+	for _, ent := range e.maps {
+		if n == sweepProbeSample/2 {
+			break
+		}
+		n++
+		e.probeWork++
+		if ent.wp.Value() == nil {
+			dead++
+		} else {
+			live++
+		}
+	}
+	if dead > live {
+		e.sweepDeadInterns()
+	}
+}
+
+// sweepDeadInterns evicts entries whose weak handle has cleared.
+func (e *codecEncoder) sweepDeadInterns() {
+	e.sweeps++
+	for k, ent := range e.ptrs {
+		if ent.wp.Value() == nil {
+			delete(e.ptrs, k)
+		}
+	}
+	for k, ent := range e.maps {
+		if ent.wp.Value() == nil {
+			delete(e.maps, k)
+		}
+	}
+	e.inserts = 0
 }
 
 // Default encode budgets: the input side is trusted (the value already
@@ -129,16 +232,19 @@ func effEncodeLimits(l Limits) Limits {
 type codecEncoder struct {
 	w           *wire.Writer
 	types       map[reflect.Type]typeEntry
-	ptrs        map[uintptr]pinnedID
-	maps        map[uintptr]pinnedID
+	ptrs        map[uintptr]weakID
+	maps        map[uintptr]weakID
+	inserts     uint64 // intern insertions since the last dead-entry sweep
+	sweeps      uint64 // dead-entry sweeps executed this stream
+	probeWork   int64  // sample liveness probes in the sweep cadence
+	encEp       uint64 // encode epoch: bumped once per Encode call
 	started     bool
 	broken      error
 	coders      map[reflect.Type]Coder  // RegisterCoder scope
 	coderTags   map[reflect.Type]uint64 // per-stream encounter-order tags
-	coderCache  map[reflect.Type]*typeCoder
-	structDescs map[reflect.Type]*wire.Desc // struct walk memo: one build per type per stream
-	asName      map[reflect.Type]string     // RegisterAs bindings: type → wire name
-	asType      map[string]reflect.Type     // RegisterAs bindings: wire name → type
+	scopeEpoch  uint64                  // registry epoch of the coder scope (plan-cache key half)
+	asName      map[reflect.Type]string // RegisterAs bindings: type → wire name
+	asType      map[string]reflect.Type // RegisterAs bindings: wire name → type
 	activeCodrs map[reflect.Type]bool
 	fac         *Encoder
 	inCoder     int                        // >0 inside a coder body: Encode skips the flush
@@ -159,23 +265,8 @@ type codecEncoder struct {
 	arena       scanArena                  // intrusive grouping arena: slots + envelope components
 	hdrVisits   map[hdrKey]uint64          // scan visited headers: key → epoch of its last visit (pooled working memory)
 	hdrEp       uint64                     // header-table epoch: bumped per scanValue, one per scan
-	skel        *skeletonScratch           // reused canonical-key render state (map ordering)
-	refFree     map[reflect.Type]bool      // scan cache: types with no reference component
-}
-
-// refFreeType reports whether t contains no reference kind (pointer,
-// slice, map, interface, channel, function) at any depth, memoized per
-// stream for the scan pass.
-func (e *codecEncoder) refFreeType(t reflect.Type) bool {
-	if hit, ok := e.refFree[t]; ok {
-		return hit
-	}
-	res := refFreeWalk(t, nil)
-	if e.refFree == nil {
-		e.refFree = make(map[reflect.Type]bool)
-	}
-	e.refFree[t] = res
-	return res
+	rankW       *rankWalker                // reused rank-cell state (map ordering)
+	ifaceMemo   map[*typePlan]bool         // key-plan interface scan results (pooled working memory)
 }
 
 func refFreeWalk(t reflect.Type, seen map[reflect.Type]bool) bool {
@@ -211,27 +302,369 @@ func refFreeWalk(t reflect.Type, seen map[reflect.Type]bool) bool {
 	return true
 }
 
-// skelScratch returns the stream's skeleton render scratch, built on
-// first use.
-func (e *codecEncoder) skelScratch() *skeletonScratch {
-	if e.skel == nil {
-		e.skel = newSkeletonScratch()
+// planOp is the dispatch class of one plan node: the precomputed
+// selection between the emission arms of the derived walk.
+type planOp uint8
+
+const (
+	opUnsupported planOp = iota
+	opBool
+	opInt
+	opUint
+	opF32
+	opF64
+	opC64
+	opC128
+	opString
+	opBlob
+	opSlice
+	opArray
+	opMap
+	opStruct
+	opPointer
+	opInterface
+	opCoder
+)
+
+// planField is one struct emission field: the target field index, its
+// byte offset in the struct layout, and the child plan, in descriptor
+// (declaration) order — blank/unexported fields excluded.
+type planField struct {
+	name  string
+	idx   int32
+	off   uintptr
+	child *typePlan
+}
+
+// planScanField is one struct scan field with its byte offset in the
+// struct layout; the scan pass visits every field.
+type planScanField struct {
+	idx  int32
+	off  uintptr
+	plan *typePlan
+}
+
+// typePlan is the immutable per-type execution plan shared by the scan
+// and emission passes — a pure function of (reflect.Type, coder-scope
+// epoch), never of stream state or cache warmth.
+type typePlan struct {
+	op         planOp
+	tc         *typeCoder // opCoder: resolved coder for the scope epoch
+	elem       *typePlan  // slice/array/pointer child
+	elemStride uintptr    // slice/array/blob element size in bytes
+	elemScan   bool       // scan recursion into elements (scanElemKind)
+	elemZero   bool       // opPointer: element type has Go size zero
+	keyFree    bool       // opMap: refFreeWalk of the key type
+	valFree    bool       // opMap: refFreeWalk of the value type
+	keyPlan    *typePlan  // opMap scan children
+	valPlan    *typePlan
+	fields     []planField     // opStruct emission fields
+	scanFields []planScanField // opStruct scan fields (all fields)
+	desc       *wire.Desc      // cached tag-free descriptor tree
+	descOk     bool            // desc is globally reusable (no per-stream tags)
+	pure       bool            // C8: empty union of sharing sources in the plan subtree
+	scanDepth  int             // static scan-walk depth of the subtree (pure nodes)
+}
+
+// planKey is the global plan-cache key: the type plus the coder-scope
+// epoch the plan was built under.
+type planKey struct {
+	t  reflect.Type
+	ep uint64
+}
+
+// planRegistry is the process-wide plan cache, unbounded by design: a
+// process's reflect.Type set is static (reflect.StructOf is the
+// exception; eviction is ownership-lifetime territory, not correctness).
+var planRegistry = struct {
+	sync.RWMutex
+	m map[planKey]*typePlan
+}{m: make(map[planKey]*typePlan)}
+
+// registryEpoch counts scope mutations process-wide; each encoder scope
+// captures the current value at every mutation and at pool inheritance,
+// so pre-resolved coders never leak across differing scopes.
+var registryEpoch atomic.Uint64
+
+// bumpScopeEpoch re-captures the registry epoch after a scope mutation.
+func (e *codecEncoder) bumpScopeEpoch() {
+	e.scopeEpoch = registryEpoch.Add(1)
+}
+
+// planFor returns the plan for t under this encoder's scope epoch,
+// building on first use; it never fails — walk-rejected types keep their
+// descriptor re-walk and per-position error text.
+func (e *codecEncoder) planFor(t reflect.Type) *typePlan {
+	key := planKey{t: t, ep: e.scopeEpoch}
+	planRegistry.RLock()
+	pl, ok := planRegistry.m[key]
+	planRegistry.RUnlock()
+	if ok {
+		return pl
 	}
-	return e.skel
+	planRegistry.Lock()
+	defer planRegistry.Unlock()
+	if pl, ok := planRegistry.m[key]; ok {
+		return pl
+	}
+	pl = buildTypePlan(t, e.coders, namingOf(e.asName))
+	planRegistry.m[key] = pl
+	return pl
+}
+
+// resolveScopeCoder is the scope-parameterized coder precedence:
+// built-in time.Time and *big.Int > RegisterCoder scope > adapters;
+// nil = derived path.
+func resolveScopeCoder(t reflect.Type, coders map[reflect.Type]Coder) *typeCoder {
+	switch {
+	case t == timeType:
+		return &typeCoder{ck: ckTime}
+	case isBigintType(t):
+		return &typeCoder{ck: ckBigint}
+	case coders[t] != nil:
+		return &typeCoder{ck: ckCustom, c: coders[t]}
+	default:
+		if ak := adapterOf(t); ak != ckNone {
+			return &typeCoder{ck: ak}
+		}
+	}
+	return nil
+}
+
+// planBuilder is the shared state of one plan-graph construction: the
+// plan memo (recursive types close over shared nodes), the merged walk
+// cache, and the tag probe flag.
+type planBuilder struct {
+	codrs     map[reflect.Type]Coder
+	naming    nameOverride
+	memo      map[reflect.Type]*typePlan
+	walkCache map[reflect.Type]*wire.Desc
+	hitTagged bool
+}
+
+// buildTypePlan constructs the plan graph for t under the given coder
+// scope and naming: children built depth-first, cycles closed on shared
+// memo nodes, descriptor subtrees walked once per build.
+func buildTypePlan(t reflect.Type, coders map[reflect.Type]Coder, naming nameOverride) *typePlan {
+	b := &planBuilder{
+		codrs:     coders,
+		naming:    naming,
+		memo:      make(map[reflect.Type]*typePlan),
+		walkCache: make(map[reflect.Type]*wire.Desc),
+	}
+	return b.build(t)
+}
+
+// probeLeaf is the build-time descriptor leaf hook: BIGINT resolves to
+// its static leaf, other coder leaves mark the subtree tag-carrying.
+func (b *planBuilder) probeLeaf(t reflect.Type) (*wire.Desc, bool) {
+	if isBigintType(t) {
+		return &wire.Desc{Kind: wire.KindBigint, Name: bigIntWireName}, true
+	}
+	if resolveScopeCoder(t, b.codrs) != nil {
+		b.hitTagged = true
+		return &wire.Desc{Kind: wire.KindCoder, Name: scopeName(b.naming, t)}, true
+	}
+	return nil, false
+}
+
+// descFor walks the descriptor for t through the shared build cache,
+// reporting whether the subtree carries per-stream coder tags.
+func (b *planBuilder) descFor(t reflect.Type) (*wire.Desc, bool, error) {
+	b.hitTagged = false
+	d, err := descWalk(t, "", b.walkCache, b.probeLeaf, b.naming)
+	return d, b.hitTagged, err
+}
+
+func (b *planBuilder) build(t reflect.Type) *typePlan {
+	if pl, ok := b.memo[t]; ok {
+		return pl
+	}
+	pl := &typePlan{}
+	b.memo[t] = pl
+	if tc := resolveScopeCoder(t, b.codrs); tc != nil {
+		// Coder leaf: opaque to the derived walk on both passes. It
+		// contributes no machinery source to the enclosing scan (the
+		// plan does not descend coder bodies); BIGINT's descriptor leaf
+		// is static, every other coder leaf carries a per-stream tag.
+		pl.op, pl.tc = opCoder, tc
+		pl.pure, pl.scanDepth = true, 1
+		if tc.ck == ckBigint {
+			if d, tagged, err := b.descFor(t); err == nil && !tagged {
+				pl.desc, pl.descOk = d, true
+			}
+		}
+		return pl
+	}
+	selfWalkable := true
+	switch t.Kind() {
+	case reflect.Bool:
+		pl.op = opBool
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		pl.op = opInt
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		pl.op = opUint
+	case reflect.Float32:
+		pl.op = opF32
+	case reflect.Float64:
+		pl.op = opF64
+	case reflect.Complex64:
+		pl.op = opC64
+	case reflect.Complex128:
+		pl.op = opC128
+	case reflect.String:
+		pl.op = opString
+	case reflect.Slice:
+		if isByteSliceBase(t) {
+			pl.op = opBlob
+		} else {
+			pl.op = opSlice
+		}
+		pl.elem = b.build(t.Elem())
+		pl.elemStride = t.Elem().Size()
+		pl.elemScan = scanElemKind(t.Elem().Kind())
+	case reflect.Array:
+		pl.op = opArray
+		pl.elem = b.build(t.Elem())
+		pl.elemStride = t.Elem().Size()
+		pl.elemScan = scanElemKind(t.Elem().Kind())
+	case reflect.Map:
+		pl.op = opMap
+		pl.keyFree = refFreeWalk(t.Key(), nil)
+		pl.valFree = refFreeWalk(t.Elem(), nil)
+		pl.keyPlan = b.build(t.Key())
+		pl.valPlan = b.build(t.Elem())
+	case reflect.Struct:
+		pl.op = opStruct
+		n := t.NumField()
+		var emit []planField
+		scanF := make([]planScanField, 0, n)
+		for i := range n {
+			f := t.Field(i)
+			child := b.build(f.Type)
+			scanF = append(scanF, planScanField{idx: int32(i), off: f.Offset, plan: child})
+			if f.Name == "_" || f.PkgPath != "" {
+				continue
+			}
+			emit = append(emit, planField{name: f.Name, idx: int32(i), off: f.Offset, child: child})
+		}
+		pl.fields, pl.scanFields = emit, scanF
+	case reflect.Pointer:
+		pl.op = opPointer
+		pl.elem = b.build(t.Elem())
+		pl.elemZero = t.Elem().Size() == 0
+	case reflect.Interface:
+		pl.op = opInterface
+	default:
+		pl.op = opUnsupported
+		selfWalkable = false
+	}
+	b.classify(pl)
+	if selfWalkable {
+		if d, tagged, err := b.descFor(t); err == nil && !tagged && b.childrenCacheable(pl) {
+			pl.desc, pl.descOk = d, true
+		}
+	}
+	return pl
+}
+
+// childrenCacheable reports whether every emission child plan is
+// descriptor-cacheable: a cached child subtree bypasses the leaf probe,
+// so a tagged or rejected child vetoes the parent's cached descriptor.
+func (b *planBuilder) childrenCacheable(pl *typePlan) bool {
+	switch pl.op {
+	case opBlob, opSlice, opArray, opPointer:
+		return pl.elem == nil || pl.elem.descOk
+	case opMap:
+		return (pl.keyPlan == nil || pl.keyPlan.descOk) &&
+			(pl.valPlan == nil || pl.valPlan.descOk)
+	case opStruct:
+		for i := range pl.fields {
+			if c := pl.fields[i].child; c != nil && !c.descOk {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// classify computes the C8 machinery class (union of sharing sources
+// over the plan subtree) and, for pure nodes, the static scan depth.
+func (b *planBuilder) classify(pl *typePlan) {
+	pure, depth := true, 1
+	child := func(c *typePlan) {
+		if c != nil && !c.pure {
+			pure = false
+		}
+	}
+	switch pl.op {
+	case opBool, opInt, opUint, opF32, opF64, opC64, opC128, opUnsupported:
+	case opString:
+		pure = false // intern source
+	case opBlob:
+		pure = false // slice: grouping source
+	case opSlice, opArray:
+		child(pl.elem)
+		if pl.elemScan && pl.elem != nil {
+			depth = 1 + pl.elem.scanDepth
+		}
+		if pl.op == opSlice {
+			pure = false // grouping source
+		}
+	case opMap:
+		pure = false // identity source
+	case opStruct:
+		for i := range pl.scanFields {
+			c := pl.scanFields[i].plan
+			child(c)
+			if c != nil && c.scanDepth >= depth {
+				depth = 1 + c.scanDepth
+			}
+		}
+	case opPointer:
+		pure = false // identity source
+	case opInterface:
+		pure = false // identity source; dynamic dispatch stays generic (A-2)
+	case opCoder:
+	}
+	if !pure {
+		depth = 1
+	}
+	pl.pure, pl.scanDepth = pure, depth
+}
+
+// rankWalker returns the stream's rank-cell walker, built on first use
+// and rebuilt on a track-mode change.
+func (e *codecEncoder) rankWalker(track bool) *rankWalker {
+	if e.rankW == nil || e.rankW.track != track {
+		e.rankW = newRankWalker(track)
+	}
+	return e.rankW
+}
+
+// keyTracksIntern memoizes the interface scan of key plans per stream.
+func (e *codecEncoder) keyTracksIntern(kp *typePlan) bool {
+	if e.ifaceMemo == nil {
+		e.ifaceMemo = make(map[*typePlan]bool)
+	}
+	if v, ok := e.ifaceMemo[kp]; ok {
+		return v
+	}
+	v := planHasInterface(kp)
+	e.ifaceMemo[kp] = v
+	return v
 }
 
 func newCodecEncoder() *codecEncoder {
 	e := &codecEncoder{
-		w:           wire.NewWriter(),
-		types:       make(map[reflect.Type]typeEntry),
-		ptrs:        make(map[uintptr]pinnedID),
-		maps:        make(map[uintptr]pinnedID),
-		coderTags:   make(map[reflect.Type]uint64),
-		coderCache:  make(map[reflect.Type]*typeCoder),
-		structDescs: make(map[reflect.Type]*wire.Desc),
-		classIx:     make(map[groupClass]*classIndex),
-		slotIx:      make(map[slotKey]int32),
-		hostCache:   make(map[hostKey]int32),
+		w:         wire.NewWriter(),
+		types:     make(map[reflect.Type]typeEntry),
+		ptrs:      make(map[uintptr]weakID),
+		maps:      make(map[uintptr]weakID),
+		coderTags: make(map[reflect.Type]uint64),
+		classIx:   make(map[groupClass]*classIndex),
+		slotIx:    make(map[slotKey]int32),
+		hostCache: make(map[hostKey]int32),
 	}
 	e.lim = effEncodeLimits(Limits{})
 	return e
@@ -573,17 +1006,23 @@ func (ix *classIndex) compact(a *scanArena) {
 // scanArena is the intrusive grouping arena: slot occurrences and
 // envelope components in flat arrays reused across marshals (epoch reset
 // in resetForPool; capacity bounded by the watermark). The scan phase
-// allocates nothing per slot.
+// allocates nothing per slot. Member backing arrays are held strongly
+// for the whole stream through the unsafe.Pointer pin column — emission
+// reads pinned memory typed by layout, and the pins drop at reset.
 type scanArena struct {
-	sVal      []reflect.Value // member slot values (zeroed on reset: no object retention)
+	sPin      []unsafe.Pointer // strong backing-array pins of member data (GC-visible holds)
+	sLen      []int            // member window length at scan time
+	sCap      []int            // member window capacity at scan time
+	sElemT    []reflect.Type   // member element type (kind and layout source of typed reads)
 	sPtr      []uintptr
 	sGen      []uint64
 	sNext     []int32 // intrusive member chain link; -1 terminates
 	comps     []envComp
-	cand      []int32  // per-insert candidate scratch
-	emitProbe []int32  // emitted-search candidate scratch
-	mem       []int32  // emission-time member chain scratch
-	win       []memWin // emission-time member window scratch
+	cand      []int32        // per-insert candidate scratch
+	emitProbe []int32        // emitted-search candidate scratch
+	mem       []int32        // emission-time member chain scratch
+	win       []memWin       // emission-time member window scratch
+	winT      []reflect.Type // per-window member element type (parallel to win)
 }
 
 // arenaSlotWatermark and arenaCompWatermark bound the arena capacity
@@ -592,25 +1031,43 @@ type scanArena struct {
 // cannot pin its arena forever. The bounds sit above the slot/component
 // peaks of the sharing-heavy workloads (a lower bound would force the
 // arena to regrow from scratch in every such marshal — measured on the
-// tree-sharing benchmark line). These are internal codec constants,
-// not Limits fields: the arena is working memory, never charged to
-// MaxBytes (the output budget).
+// tree-sharing benchmark line). Retention ends at reset: the pin column
+// and the window scratch tail are zeroed there, so no member window or
+// backing-array reference survives in retained capacity between streams.
+// These are internal codec constants, not Limits fields: the arena is
+// working memory, never charged to MaxBytes (the output budget).
 const (
 	arenaSlotWatermark = 1 << 16
 	arenaCompWatermark = 1 << 14
 )
 
-// reset returns the arena to fresh-stream state: member values released
-// (no object-graph retention between marshals), lengths zeroed,
-// capacity kept up to the watermark.
+// reset returns the arena to fresh-stream state: member pins and window
+// scratch zeroed over the retained capacity (no object retention, no
+// cross-stream window residual), lengths zeroed, capacity bounded.
 func (a *scanArena) reset() {
-	full := a.sVal[:cap(a.sVal)]
-	for i := range full {
-		full[i] = reflect.Value{}
+	fullPin := a.sPin[:cap(a.sPin)]
+	for i := range fullPin {
+		fullPin[i] = nil
 	}
-	a.sVal = a.sVal[:0]
-	if cap(a.sVal) > arenaSlotWatermark {
-		a.sVal = make([]reflect.Value, 0, arenaSlotWatermark)
+	a.sPin = a.sPin[:0]
+	if cap(a.sPin) > arenaSlotWatermark {
+		a.sPin = make([]unsafe.Pointer, 0, arenaSlotWatermark)
+	}
+	fullET := a.sElemT[:cap(a.sElemT)]
+	for i := range fullET {
+		fullET[i] = nil
+	}
+	a.sElemT = a.sElemT[:0]
+	if cap(a.sElemT) > arenaSlotWatermark {
+		a.sElemT = make([]reflect.Type, 0, arenaSlotWatermark)
+	}
+	a.sLen = a.sLen[:0]
+	if cap(a.sLen) > arenaSlotWatermark {
+		a.sLen = make([]int, 0, arenaSlotWatermark)
+	}
+	a.sCap = a.sCap[:0]
+	if cap(a.sCap) > arenaSlotWatermark {
+		a.sCap = make([]int, 0, arenaSlotWatermark)
 	}
 	a.sPtr = a.sPtr[:0]
 	if cap(a.sPtr) > arenaSlotWatermark {
@@ -630,7 +1087,16 @@ func (a *scanArena) reset() {
 	}
 	a.cand = a.cand[:0]
 	a.emitProbe = a.emitProbe[:0]
+	fullWin := a.win[:cap(a.win)]
+	for i := range fullWin {
+		fullWin[i] = memWin{}
+	}
 	a.win = a.win[:0]
+	fullWinT := a.winT[:cap(a.winT)]
+	for i := range fullWinT {
+		fullWinT[i] = nil
+	}
+	a.winT = a.winT[:0]
 }
 
 // slotKey is the emission-resolution key of one slot occurrence: the
@@ -666,25 +1132,10 @@ func (e *codecEncoder) bytesOut() int {
 // path. The built-in BIGINT kind outranks the automatic text adapter of
 // math/big (encode precedence): the canonical
 // encoding of a big integer is the BIGINT kind, never the adapter STRING.
+// The resolution lives in the type's plan, built once per (type, scope
+// epoch) in the global plan cache.
 func (e *codecEncoder) coderFor(t reflect.Type) *typeCoder {
-	if tc, ok := e.coderCache[t]; ok {
-		return tc
-	}
-	var tc *typeCoder
-	switch {
-	case t == timeType:
-		tc = &typeCoder{ck: ckTime}
-	case isBigintType(t):
-		tc = &typeCoder{ck: ckBigint}
-	case e.coders[t] != nil:
-		tc = &typeCoder{ck: ckCustom, c: e.coders[t]}
-	default:
-		if ak := adapterOf(t); ak != ckNone {
-			tc = &typeCoder{ck: ak}
-		}
-	}
-	e.coderCache[t] = tc
-	return tc
+	return e.planFor(t).tc
 }
 
 // coderTag assigns the per-stream coder tag in first-dispatch order:
@@ -781,22 +1232,25 @@ func (e *codecEncoder) resetForPool(src *codecEncoder) {
 	if src != nil {
 		e.coders = src.coders
 		e.lim = src.lim
+		e.scopeEpoch = src.scopeEpoch
 	} else {
 		e.coders = nil
 		e.lim = effEncodeLimits(Limits{})
+		e.scopeEpoch = 0
 	}
 	clear(e.types)
 	clear(e.ptrs)
 	clear(e.maps)
+	e.inserts = 0
+	e.sweeps = 0
+	e.probeWork = 0
+	e.encEp = 0
 	clear(e.coderTags)
-	clear(e.coderCache)
-	clear(e.structDescs)
 	clear(e.classIx)
 	clear(e.slotIx)
 	clear(e.hostCache)
 	e.hostHits = 0
 	e.hostMisses = 0
-	clear(e.refFree)
 	e.arena.reset()
 	e.started = false
 	e.broken = nil
@@ -883,6 +1337,7 @@ func (e *codecEncoder) Encode(v any) error {
 		e.started = true
 		e.streamStart = len(e.w.Bytes())
 	}
+	e.encEp++
 	e.growForRoot(v)
 	if err := e.encodeRoot(v); err != nil {
 		err = liftEncodeWire(err, "")
@@ -912,7 +1367,11 @@ func (e *codecEncoder) encodeValue(v reflect.Value, p pathNode) error {
 
 // writeDescOf emits DESC literal once per reflect.Type per stream, REF on
 // repeat. The emitted id is learned by peeking Writer.NextID before
-// the literal write (WriteDesc allocates its id first).
+// the literal write (WriteDesc allocates its id first). The descriptor
+// tree comes from the type's plan when the subtree carries no per-stream
+// coder tags; tag-carrying and walk-rejected types re-walk per stream
+// miss, so error paths keep their per-position text and CODER leaves
+// get fresh encounter-order tags.
 func (e *codecEncoder) writeDescOf(t reflect.Type, p pathNode) error {
 	if ent, hit := e.types[t]; hit {
 		if ent.ok {
@@ -920,9 +1379,14 @@ func (e *codecEncoder) writeDescOf(t reflect.Type, p pathNode) error {
 		}
 		return e.w.WriteDesc(ent.d)
 	}
-	d, err := e.coderBuildDesc(t, p.String(), make(map[reflect.Type]*wire.Desc))
-	if err != nil {
-		return err
+	pl := e.planFor(t)
+	d := pl.desc
+	if !pl.descOk {
+		var err error
+		d, err = e.coderBuildDesc(t, p.String(), make(map[reflect.Type]*wire.Desc))
+		if err != nil {
+			return err
+		}
 	}
 	id := e.w.NextID()
 	if err := e.w.WriteDesc(d); err != nil {
@@ -946,31 +1410,13 @@ func (e *codecEncoder) wireNaming() nameOverride {
 	return namingOf(e.asName)
 }
 
-// structFor returns the struct field descriptor for t, built once per
-// stream per type through the coder-leaf dispatch (coderBuildDesc), so
-// coder-covered field types become CODER leaves matching the bodies
-// encodeBody emits. Errors are not cached: a failed walk is
-// re-attempted per occurrence, so each reports its own path. The cache
-// carries no synchronization — per-stream state is single-goroutine
-// (see Encoder).
-func (e *codecEncoder) structFor(t reflect.Type, p pathNode) (*wire.Desc, error) {
-	if d, ok := e.structDescs[t]; ok {
-		return d, nil
-	}
-	d, err := e.coderBuildDesc(t, p.String(), make(map[reflect.Type]*wire.Desc))
-	if err != nil {
-		return nil, err
-	}
-	e.structDescs[t] = d
-	return d, nil
-}
-
 // encodeBody guards the output budgets around the value-body write: one
 // output node per call, one recursion frame per call, and the stream's
 // output byte count re-checked after the write. A budget breach is an
 // ErrBudget error and breaks the stream like any encoder error (sticky
 // via broken; the partial buffer is never flushed).
 func (e *codecEncoder) encodeBody(v reflect.Value, p pathNode) error {
+	e.emitStep()
 	e.nodes++
 	if e.nodes > e.lim.MaxNodes {
 		return errBudget(classBudgetNodes, -1, p.String(), nil, e.lim.MaxNodes, errDetail(fmt.Sprintf("output nodes exceed MaxNodes budget %d", e.lim.MaxNodes)))
@@ -991,57 +1437,53 @@ func (e *codecEncoder) encodeBody(v reflect.Value, p pathNode) error {
 	return nil
 }
 
-// encodeBodyInner writes the value-body tokens for v (opcode table). Descriptor
-// emission already happened at the enclosing type-ref position.
+// encodeBodyInner writes the value-body tokens for v, dispatching on the
+// type's precomputed plan. Descriptor emission already happened at the
+// enclosing type-ref position.
 func (e *codecEncoder) encodeBodyInner(v reflect.Value, p pathNode) error {
-	t := v.Type()
-	if tc := e.coderFor(t); tc != nil {
-		return tc.encode(e, v, p)
-	}
-	switch t.Kind() {
-	case reflect.Bool:
+	pl := e.planFor(v.Type())
+	switch pl.op {
+	case opCoder:
+		return pl.tc.encode(e, v, p)
+	case opBool:
 		return e.w.WriteBool(v.Bool())
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+	case opInt:
 		return e.w.WriteInt(v.Int())
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+	case opUint:
 		return e.w.WriteUint(v.Uint())
-	case reflect.Float32:
+	case opF32:
 		return e.w.WriteFloat32(float32(v.Float()))
-	case reflect.Float64:
+	case opF64:
 		return e.w.WriteFloat64(v.Float())
-	case reflect.Complex64:
+	case opC64:
 		return e.w.WriteComplex64(complex64(v.Complex()))
-	case reflect.Complex128:
+	case opC128:
 		return e.w.WriteComplex128(v.Complex())
-	case reflect.String:
+	case opString:
 		return e.w.WriteString(v.String())
-	case reflect.Slice:
-		if isByteSliceBase(t) {
-			return e.encodeBlob(v, p)
-		}
+	case opBlob:
+		return e.encodeBlob(v, p)
+	case opSlice:
 		return e.encodeSlice(v, p)
-	case reflect.Array:
+	case opArray:
 		return e.encodeArray(v, p)
-	case reflect.Map:
-		return e.encodeMap(v, p)
-	case reflect.Struct:
+	case opMap:
+		return e.encodeMap(v, p, pl.keyPlan)
+	case opStruct:
 		if err := e.w.WriteStructHeader(); err != nil {
 			return err
 		}
-		d, err := e.structFor(t, p)
-		if err != nil {
-			return err
-		}
-		for _, f := range d.Fields {
-			fn := pathNode{parent: &p, name: f.Name, idx: -1}
-			if err := e.encodeBody(v.Field(f.Idx), fn); err != nil {
+		for i := range pl.fields {
+			f := &pl.fields[i]
+			fn := pathNode{parent: &p, name: f.name, idx: -1}
+			if err := e.encodeBody(v.Field(int(f.idx)), fn); err != nil {
 				return err
 			}
 		}
 		return nil
-	case reflect.Pointer:
+	case opPointer:
 		return e.encodePointer(v, p)
-	case reflect.Interface:
+	case opInterface:
 		if v.IsNil() {
 			return e.w.WriteNil(wire.NilInterface)
 		}
@@ -1051,7 +1493,7 @@ func (e *codecEncoder) encodeBodyInner(v reflect.Value, p pathNode) error {
 		}
 		return e.encodeBody(dv, p)
 	default:
-		return unsupportedAt("kind "+t.Kind().String(), p.String())
+		return unsupportedAt("kind "+v.Kind().String(), p.String())
 	}
 }
 
@@ -1110,6 +1552,130 @@ func isBitZero(v reflect.Value) bool {
 	}
 }
 
+// memSlice mirrors the in-memory slice header layout {data, len, cap};
+// the len field is the zero-predicate input for slice members.
+type memSlice struct {
+	data unsafe.Pointer
+	n, c int
+}
+
+// bigIntAbsOffset is the byte offset of the abs field in math/big.Int
+// (reflect metadata, computed once); a big.Int is wire-zero exactly when
+// len(abs) == 0 — the Sign()==0 form of the reflect predicate above.
+var bigIntAbsOffset = reflect.TypeFor[big.Int]().Field(1).Offset
+
+// isBitZeroAt is the typed twin of isBitZero: the same bitwise-zero
+// predicate reading pinned memory at p (nil for slices/maps/pointers,
+// empty length for strings, zero bit patterns, big.Int nil-or-zero).
+func isBitZeroAt(t reflect.Type, p unsafe.Pointer) bool {
+	switch t.Kind() {
+	case reflect.Bool:
+		return !*(*bool)(p)
+	case reflect.Int:
+		return *(*int)(p) == 0
+	case reflect.Int8:
+		return *(*int8)(p) == 0
+	case reflect.Int16:
+		return *(*int16)(p) == 0
+	case reflect.Int32:
+		return *(*int32)(p) == 0
+	case reflect.Int64:
+		return *(*int64)(p) == 0
+	case reflect.Uint:
+		return *(*uint)(p) == 0
+	case reflect.Uint8:
+		return *(*uint8)(p) == 0
+	case reflect.Uint16:
+		return *(*uint16)(p) == 0
+	case reflect.Uint32:
+		return *(*uint32)(p) == 0
+	case reflect.Uint64:
+		return *(*uint64)(p) == 0
+	case reflect.Uintptr:
+		return *(*uintptr)(p) == 0
+	case reflect.Float32:
+		return math.Float32bits(*(*float32)(p)) == 0
+	case reflect.Float64:
+		return math.Float64bits(*(*float64)(p)) == 0
+	case reflect.Complex64:
+		c := *(*complex64)(p)
+		return math.Float32bits(real(c)) == 0 && math.Float32bits(imag(c)) == 0
+	case reflect.Complex128:
+		c := *(*complex128)(p)
+		return math.Float64bits(real(c)) == 0 && math.Float64bits(imag(c)) == 0
+	case reflect.String:
+		return len(*(*string)(p)) == 0
+	case reflect.Slice:
+		return (*memSlice)(p).data == nil
+	case reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return *(*unsafe.Pointer)(p) == nil
+	case reflect.Pointer:
+		pp := *(*unsafe.Pointer)(p)
+		if t == bigIntPtrType {
+			return pp == nil || (*memSlice)(unsafe.Add(pp, bigIntAbsOffset)).n == 0
+		}
+		return pp == nil
+	case reflect.Interface:
+		w := *(*[2]unsafe.Pointer)(p)
+		return w[0] == nil && w[1] == nil
+	case reflect.Struct:
+		for i := range t.NumField() {
+			f := t.Field(i)
+			if !isBitZeroAt(f.Type, unsafe.Add(p, f.Offset)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Array:
+		es := t.Elem().Size()
+		for i := range t.Len() {
+			if !isBitZeroAt(t.Elem(), unsafe.Add(p, uintptr(i)*es)) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// writePrimAt writes one primitive value body read at p without the
+// encodeBody frame; the typed twin of the former reflect read path.
+func writePrimAt(w *wire.Writer, k reflect.Kind, p unsafe.Pointer) error {
+	switch k {
+	case reflect.Bool:
+		return w.WriteBool(*(*bool)(p))
+	case reflect.Int:
+		return w.WriteInt(int64(*(*int)(p)))
+	case reflect.Int8:
+		return w.WriteInt(int64(*(*int8)(p)))
+	case reflect.Int16:
+		return w.WriteInt(int64(*(*int16)(p)))
+	case reflect.Int32:
+		return w.WriteInt(int64(*(*int32)(p)))
+	case reflect.Int64:
+		return w.WriteInt(*(*int64)(p))
+	case reflect.Uint:
+		return w.WriteUint(uint64(*(*uint)(p)))
+	case reflect.Uint8:
+		return w.WriteUint(uint64(*(*uint8)(p)))
+	case reflect.Uint16:
+		return w.WriteUint(uint64(*(*uint16)(p)))
+	case reflect.Uint32:
+		return w.WriteUint(uint64(*(*uint32)(p)))
+	case reflect.Uint64:
+		return w.WriteUint(*(*uint64)(p))
+	case reflect.Float32:
+		return w.WriteFloat32(*(*float32)(p))
+	case reflect.Float64:
+		return w.WriteFloat64(*(*float64)(p))
+	case reflect.Complex64:
+		return w.WriteComplex64(*(*complex64)(p))
+	case reflect.Complex128:
+		return w.WriteComplex128(*(*complex128)(p))
+	}
+	return errUnsupported(classUnsupportedKind, "", nil, nil, errDetail(fmt.Sprintf("no primitive batch path for kind %s", k)))
+}
+
 // densePrefix returns the dense prefix E over the slice elements.
 func densePrefix(v reflect.Value) uint64 {
 	n := v.Len()
@@ -1125,10 +1691,20 @@ func densePrefix(v reflect.Value) uint64 {
 // reference-kind encounter rule so cycles terminate. The header half of
 // the visited state is the pooled epoch table on the encoder: each scan
 // opens a fresh epoch, so no header entry survives into this scan's
-// decisions.
+// decisions. A pure-class type (C8: empty union of sharing sources in
+// the plan subtree — numeric DTO) runs no walk at all: no slot, header,
+// or identity machinery can fire, and the only scan-observable effect —
+// the depth budget trip — is reproduced from the plan's static depth.
 func (e *codecEncoder) scanValue(v reflect.Value) error {
 	e.hdrEp++
-	return e.scan(v, newVisitedSet())
+	pl := e.planFor(v.Type())
+	if pl.pure {
+		if e.depth+pl.scanDepth > e.lim.MaxDepth {
+			return errBudget(classBudgetDepth, -1, "", nil, e.lim.MaxDepth, errDetail(fmt.Sprintf("output depth exceeds MaxDepth budget %d", e.lim.MaxDepth)))
+		}
+		return nil
+	}
+	return e.scan(v, newVisitedSet(), pl)
 }
 
 // visitedSet is the scan-visited state for pointer and map addresses:
@@ -1211,13 +1787,13 @@ func (e *codecEncoder) visitHdr(k hdrKey) bool {
 	return false
 }
 
-func (e *codecEncoder) scan(v reflect.Value, visited *visitedSet) error {
+func (e *codecEncoder) scan(v reflect.Value, visited *visitedSet, pl *typePlan) error {
 	e.depth++
 	if e.depth > e.lim.MaxDepth {
 		e.depth--
 		return errBudget(classBudgetDepth, -1, "", nil, e.lim.MaxDepth, errDetail(fmt.Sprintf("output depth exceeds MaxDepth budget %d", e.lim.MaxDepth)))
 	}
-	err := e.scanInner(v, visited)
+	err := e.scanInner(v, visited, pl)
 	e.depth--
 	return err
 }
@@ -1235,72 +1811,72 @@ func scanElemKind(k reflect.Kind) bool {
 	return false
 }
 
-func (e *codecEncoder) scanInner(v reflect.Value, visited *visitedSet) error {
-	if e.coderFor(v.Type()) != nil {
+func (e *codecEncoder) scanInner(v reflect.Value, visited *visitedSet, pl *typePlan) error {
+	switch pl.op {
+	case opCoder:
 		return nil // coder values are opaque leaves
-	}
-	switch v.Kind() {
-	case reflect.Slice:
+	case opBlob, opSlice:
 		if !v.IsNil() {
-			if err := e.scanAddSlot(v, isByteSliceBase(v.Type())); err != nil {
+			if err := e.scanAddSlot(v, pl.op == opBlob); err != nil {
 				return err
 			}
 			if e.visitHdr(hdrKey{ptr: v.Pointer(), len: v.Len(), cap: v.Cap()}) {
 				return nil
 			}
-			if scanElemKind(v.Type().Elem().Kind()) {
+			if pl.elemScan {
 				for i := 0; i < v.Len(); i++ {
-					if err := e.scan(v.Index(i), visited); err != nil {
+					if err := e.scan(v.Index(i), visited, pl.elem); err != nil {
 						return err
 					}
 				}
 			}
 		}
-	case reflect.Array:
-		if scanElemKind(v.Type().Elem().Kind()) {
+	case opArray:
+		if pl.elemScan {
 			for i := 0; i < v.Len(); i++ {
-				if err := e.scan(v.Index(i), visited); err != nil {
+				if err := e.scan(v.Index(i), visited, pl.elem); err != nil {
 					return err
 				}
 			}
 		}
-	case reflect.Struct:
-		for i := 0; i < v.NumField(); i++ {
-			if err := e.scan(v.Field(i), visited); err != nil {
+	case opStruct:
+		for i := range pl.scanFields {
+			f := &pl.scanFields[i]
+			if err := e.scan(v.Field(int(f.idx)), visited, f.plan); err != nil {
 				return err
 			}
 		}
-	case reflect.Map:
+	case opMap:
 		if visited.visitScalar(v.Pointer()) {
 			return nil
 		}
 		// Reference-free pairs (e.g. map[string]string) hold nothing the
 		// scan tracks — no backing slots, no pointer/map identities — so
 		// the per-entry iteration copies are pure overhead.
-		if e.refFreeType(v.Type().Key()) && e.refFreeType(v.Type().Elem()) {
+		if pl.keyFree && pl.valFree {
 			return nil
 		}
 		iter := v.MapRange()
 		for iter.Next() {
-			if err := e.scan(iter.Key(), visited); err != nil {
+			if err := e.scan(iter.Key(), visited, pl.keyPlan); err != nil {
 				return err
 			}
-			if err := e.scan(iter.Value(), visited); err != nil {
+			if err := e.scan(iter.Value(), visited, pl.valPlan); err != nil {
 				return err
 			}
 		}
-	case reflect.Pointer:
-		if !v.IsNil() && v.Type().Elem().Size() != 0 {
+	case opPointer:
+		if !v.IsNil() && !pl.elemZero {
 			if visited.visitScalar(v.Pointer()) {
 				return nil
 			}
-			if err := e.scan(v.Elem(), visited); err != nil {
+			if err := e.scan(v.Elem(), visited, pl.elem); err != nil {
 				return err
 			}
 		}
-	case reflect.Interface:
+	case opInterface:
 		if !v.IsNil() {
-			if err := e.scan(v.Elem(), visited); err != nil {
+			if err := e.scan(v.Elem(), visited, e.planFor(v.Elem().Type())); err != nil {
 				return err
 			}
 		}
@@ -1533,11 +2109,25 @@ func (e *codecEncoder) scanAddSlot(v reflect.Value, blob bool) error {
 }
 
 // arenaAppendSlot stores one member slot in the arena and returns its
-// index; the intrusive chain link starts terminated.
+// index; the intrusive chain link starts terminated. The backing array
+// is pinned strongly through the sPin column; sPtr stays an identity key.
 func (e *codecEncoder) arenaAppendSlot(v reflect.Value, p uintptr) int32 {
 	a := &e.arena
-	si := int32(len(a.sVal))
-	a.sVal = append(a.sVal, v)
+	si := int32(len(a.sPin))
+	// Real members are always slice windows; values of other kinds appear
+	// only in direct unit probes and carry no backing array to pin.
+	var pin unsafe.Pointer
+	var l, c int
+	var et reflect.Type
+	if v.Kind() == reflect.Slice {
+		pin = v.UnsafePointer()
+		l, c = v.Len(), v.Cap()
+		et = v.Type().Elem()
+	}
+	a.sPin = append(a.sPin, pin)
+	a.sLen = append(a.sLen, l)
+	a.sCap = append(a.sCap, c)
+	a.sElemT = append(a.sElemT, et)
 	a.sPtr = append(a.sPtr, p)
 	a.sGen = append(a.sGen, e.gen)
 	a.sNext = append(a.sNext, -1)
@@ -1565,7 +2155,7 @@ func (e *codecEncoder) mergeInto(into, g int32) {
 	ix := e.classIndexOf(groupClass{es: cg.es, blob: cg.blob})
 	ix.envNoteDead(a, g)
 	for m := cg.head; m >= 0; m = a.sNext[m] {
-		e.slotIx[slotKey{gen: a.sGen[m], ptr: a.sPtr[m], n: a.sVal[m].Len(), c: a.sVal[m].Cap(), blob: cg.blob}] = into
+		e.slotIx[slotKey{gen: a.sGen[m], ptr: a.sPtr[m], n: a.sLen[m], c: a.sCap[m], blob: cg.blob}] = into
 	}
 }
 
@@ -1612,19 +2202,11 @@ func (e *codecEncoder) covering(c *envComp, i uint64) int32 {
 	a := &e.arena
 	for m := c.head; m >= 0; m = a.sNext[m] {
 		off := uint64((a.sPtr[m] - c.origin) / c.es)
-		if i >= off && i < off+uint64(a.sVal[m].Cap()) {
+		if i >= off && i < off+uint64(a.sCap[m]) {
 			return m
 		}
 	}
 	return -1
-}
-
-// elemAt reads union element i through a covering member window.
-func (e *codecEncoder) elemAt(c *envComp, i uint64) reflect.Value {
-	a := &e.arena
-	m := e.covering(c, i)
-	off := int(i - uint64((a.sPtr[m]-c.origin)/c.es))
-	return a.sVal[m].Slice(off, off+1).Index(0)
 }
 
 // length returns L in elements.
@@ -1634,11 +2216,21 @@ func (c *envComp) length() uint64 { return uint64((c.end - c.origin) / c.es) }
 // (elision predicate).
 func (e *codecEncoder) denseE(c *envComp) uint64 {
 	for i := c.length(); i > 0; i-- {
-		if !isBitZero(e.elemAt(c, i-1)) {
+		if !e.elemBitZero(c, i-1) {
 			return i
 		}
 	}
 	return 0
+}
+
+// elemBitZero reads union element i typed through its covering member:
+// the element address is the member pin advanced by the local index
+// times the element stride; the predicate is the typed bitwise-zero.
+func (e *codecEncoder) elemBitZero(c *envComp, i uint64) bool {
+	a := &e.arena
+	m := e.covering(c, i)
+	off := i - uint64((a.sPtr[m]-c.origin)/c.es)
+	return isBitZeroAt(a.sElemT[m], unsafe.Add(a.sPin[m], uintptr(off)*c.es))
 }
 
 // writeGroupRecord emits the component ARRAY record with elements
@@ -1658,21 +2250,28 @@ func (e *codecEncoder) writeGroupRecord(ci int32, p pathNode) error {
 	if err := e.w.WriteArrayHeader(L, E); err != nil {
 		return err
 	}
-	if primBatchKind(a.sVal[c.head].Type().Elem().Kind()) != reflect.Invalid {
+	if primBatchKind(a.sElemT[c.head].Kind()) != reflect.Invalid {
 		return e.writeGroupElems(ci, E, p)
 	}
-	// Non-primitive elements go through one resliced window per member:
-	// per-element Value.Slice allocates (reflect's GC-visibility header),
-	// Index over a fixed window does not. The window list is copied out
-	// of the arena scratch: the recursive encodeBody below re-enters
-	// emission for nested groups and would clobber it.
+	// Non-primitive elements go through one pinned window per member:
+	// the window value is reconstructed once per member over the pinned
+	// data (Index over a fixed window does not allocate per element);
+	// the recursive encodeBody below re-enters emission for nested
+	// groups, so the window list is copied out of the arena scratch
+	// before the loop.
 	wins := append([]memWin(nil), e.compWindows(ci, E)...)
+	vals := make([]reflect.Value, len(wins))
+	for i := range wins {
+		hdr := memSlice{data: wins[i].ptr, n: int(wins[i].n), c: int(wins[i].n)}
+		vals[i] = reflect.NewAt(reflect.SliceOf(a.winT[i]), unsafe.Pointer(&hdr)).Elem()
+	}
 	for i := range E {
 		for len(wins) > 1 && i >= wins[0].off+wins[0].n {
 			wins = wins[1:]
+			vals = vals[1:]
 		}
 		en := pathNode{parent: &p, idx: int(i)}
-		if err := e.encodeBody(wins[0].val.Index(int(i-wins[0].off)), en); err != nil {
+		if err := e.encodeBody(vals[0].Index(int(i-wins[0].off)), en); err != nil {
 			return err
 		}
 	}
@@ -1680,8 +2279,8 @@ func (e *codecEncoder) writeGroupRecord(ci int32, p pathNode) error {
 }
 
 // writeGroupElems writes E primitive elements through the member windows
-// in index order. Element sources never overlap observably: windows over
-// the same memory read the same bytes regardless of the covering member.
+// in index order (pinned reads at window-local index times the element
+// stride); windows over the same memory read the same bytes either way.
 func (e *codecEncoder) writeGroupElems(ci int32, E uint64, p pathNode) error {
 	if E == 0 {
 		return nil
@@ -1692,19 +2291,20 @@ func (e *codecEncoder) writeGroupElems(ci int32, E uint64, p pathNode) error {
 	}
 	a := &e.arena
 	wins := e.compWindows(ci, E)
-	k := primBatchKind(a.sVal[a.comps[ci].head].Type().Elem().Kind())
+	k := primBatchKind(a.sElemT[a.comps[ci].head].Kind())
 	w := e.w
 	for i := range E {
+		e.emitStep()
 		for len(wins) > 1 && i >= wins[0].off+wins[0].n {
 			wins = wins[1:]
 		}
-		v := wins[0].val.Index(int(i - wins[0].off))
+		el := unsafe.Add(wins[0].ptr, uintptr(i-wins[0].off)*a.comps[ci].es)
 		e.nodes++
 		if e.nodes > e.lim.MaxNodes {
 			en := pathNode{parent: &p, idx: int(i)}
 			return errBudget(classBudgetNodes, -1, en.String(), nil, e.lim.MaxNodes, errDetail(fmt.Sprintf("output nodes exceed MaxNodes budget %d", e.lim.MaxNodes)))
 		}
-		if err := writePrim(w, k, v); err != nil {
+		if err := writePrimAt(w, k, el); err != nil {
 			return err
 		}
 		if e.bytesOut() > e.lim.MaxBytes {
@@ -1715,60 +2315,59 @@ func (e *codecEncoder) writeGroupElems(ci int32, E uint64, p pathNode) error {
 	return nil
 }
 
-// memWin is one member window resliced for direct element access: val
-// spans [0, n) of the union index space starting at off.
+// memWin is one member window pinned for direct element access: the
+// span [0, n) of the union index space starting at off, over the
+// backing array pinned at ptr.
 type memWin struct {
 	off uint64
 	n   uint64
-	val reflect.Value
+	ptr unsafe.Pointer
 }
 
 // compWindows returns the member windows of component ci covering [0, E),
-// resliced to their cap span and ordered by offset, with overlaps
-// collapsed to the first window in member order. The window scratch
-// lives in the arena: emission allocates nothing per member.
+// clamped to their cap span and ordered by offset, with overlaps
+// collapsed to the first window in member order; per-window element
+// types land in the parallel winT scratch.
 func (e *codecEncoder) compWindows(ci int32, E uint64) []memWin {
 	a := &e.arena
 	c := &a.comps[ci]
-	if c.head == c.tail {
-		m := c.head
-		n := min(uint64(a.sVal[m].Cap()), E)
-		a.win = a.win[:0]
-		a.win = append(a.win, memWin{off: 0, n: n, val: a.sVal[m].Slice(0, int(n))})
-		return a.win
-	}
 	members := a.compMembers(ci, a.mem)
 	a.win = a.win[:0]
+	a.winT = a.winT[:0]
 	for _, m := range members {
 		off := uint64((a.sPtr[m] - c.origin) / c.es)
-		n := uint64(a.sVal[m].Cap())
+		n := uint64(a.sCap[m])
 		if off >= E {
 			continue
 		}
 		if off+n > E {
 			n = E - off
 		}
-		a.win = append(a.win, memWin{off: off, n: n, val: a.sVal[m].Slice(0, int(n))})
+		a.win = append(a.win, memWin{off: off, n: n, ptr: a.sPin[m]})
+		a.winT = append(a.winT, a.sElemT[m])
 	}
-	slices.SortFunc(a.win, func(x, y memWin) int {
-		switch {
-		case x.off < y.off:
-			return -1
-		case x.off > y.off:
-			return 1
+	// Insertion sort keeps equal-offset windows in member order (the
+	// collapse below takes the first in member order); the element-type
+	// scratch moves with its window.
+	for i := range a.win {
+		for j := i; j > 0 && a.win[j].off < a.win[j-1].off; j-- {
+			a.win[j], a.win[j-1] = a.win[j-1], a.win[j]
+			a.winT[j], a.winT[j-1] = a.winT[j-1], a.winT[j]
 		}
-		return 0
-	})
+	}
 	out := a.win[:0]
+	outT := a.winT[:0]
 	var covered uint64
-	for _, wv := range a.win {
+	for i, wv := range a.win {
 		end := wv.off + wv.n
 		if end <= covered {
 			continue
 		}
 		out = append(out, wv)
+		outT = append(outT, a.winT[i])
 		covered = end
 	}
+	a.winT = outT
 	return out
 }
 
@@ -1786,7 +2385,8 @@ func primBatchKind(k reflect.Kind) reflect.Kind {
 	return reflect.Invalid
 }
 
-// writePrim writes one primitive value body without the encodeBody frame.
+// writePrim writes one primitive value body of a live value without the
+// encodeBody frame (the guarded path of fresh records and arrays).
 func writePrim(w *wire.Writer, k reflect.Kind, v reflect.Value) error {
 	switch k {
 	case reflect.Bool:
@@ -1840,12 +2440,13 @@ func (e *codecEncoder) encodeBlob(v reflect.Value, p pathNode) error {
 		L := c.length()
 		buf := make([]byte, L)
 		for m := c.head; m >= 0; m = a.sNext[m] {
+			e.emitStep()
 			off := uint64((a.sPtr[m] - c.origin) / c.es)
-			n := uint64(a.sVal[m].Cap())
+			n := uint64(a.sCap[m])
 			if off+n > L {
 				n = L - off
 			}
-			copy(buf[off:], a.sVal[m].Slice(0, int(n)).Bytes())
+			copy(buf[off:], unsafe.Slice((*byte)(a.sPin[m]), int(n)))
 		}
 		E := denseBytes(buf)
 		c.emitted = true
@@ -1913,13 +2514,12 @@ func (e *codecEncoder) writePrimElems(v reflect.Value, E uint64, p pathNode) err
 	k := primBatchKind(v.Type().Elem().Kind())
 	w := e.w
 	for i := range E {
-		el := v.Index(int(i))
 		e.nodes++
 		if e.nodes > e.lim.MaxNodes {
 			en := pathNode{parent: &p, idx: int(i)}
 			return errBudget(classBudgetNodes, -1, en.String(), nil, e.lim.MaxNodes, errDetail(fmt.Sprintf("output nodes exceed MaxNodes budget %d", e.lim.MaxNodes)))
 		}
-		if err := writePrim(w, k, el); err != nil {
+		if err := writePrim(w, k, v.Index(int(i))); err != nil {
 			return err
 		}
 		if e.bytesOut() > e.lim.MaxBytes {
@@ -1981,13 +2581,13 @@ func (e *codecEncoder) encodeArray(v reflect.Value, p pathNode) error {
 // encodeMap writes a map body: an intern-space record (the id lands at the
 // header, DFS preorder like array/blob records; repeated encounters emit a
 // REF, preserving map identity through the round trip) whose pairs follow in
-// canonical order: primary sort by key skeleton
-// (literal canonical bytes), tie-break by pair value bytes, final tie-break
-// by the full DFS sequence of pointer-component addresses of the key for a
-// total deterministic order. Key
+// canonical order: primary sort by the key's rank cells (integer mirror of
+// the key skeleton bytes, see rankLess), tie-break by pair value bytes,
+// final tie-break by the full DFS sequence of pointer-component addresses
+// of the key for a total deterministic order. Key
 // emission itself is the regular body encoding, so pointer keys intern in
 // the unified object space.
-func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode) error {
+func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode, kp *typePlan) error {
 	if v.IsNil() {
 		return e.w.WriteNil(wire.NilMap)
 	}
@@ -1998,8 +2598,10 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode) error {
 	if e.coderFor(kt) != nil && !isBigintType(kt) {
 		return unsupportedAt("coder-coded map key type "+nameOf(kt)+" (no canonical key bytes)", p.String())
 	}
-	if ent, hit := e.maps[v.Pointer()]; hit {
-		return e.w.WriteRef(ent.id)
+	if ent, hit := e.maps[uintptr(v.UnsafePointer())]; hit {
+		if id, live := e.alive(uintptr(v.UnsafePointer()), ent, e.maps); live {
+			return e.w.WriteRef(id)
+		}
 	}
 	if kt == stringType && v.Type().Elem() == stringType && e.coderFor(v.Type().Elem()) == nil {
 		return e.encodeStringMap(v, p)
@@ -2008,15 +2610,19 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode) error {
 		return e.encodeBytesMap(v, p)
 	}
 	// Deterministic pair order is a three-phase tie-break over the key
-	// categories: skeleton bytes, then value bytes, then the pointer
-	// sequence. The value-bytes phase runs a full scoped sub-marshal per
-	// pair it reaches (only pairs with equal skeletons get compared), so
-	// structurally equal pointer keys cost O(n log n·|V|) marshal work —
+	// categories: skeleton order, then value bytes, then the pointer
+	// sequence. The skeleton phase compares rank cells — integers that
+	// mirror the canonical skeleton bytes without rendering them (the
+	// intern bookkeeping a render would do is simulated only for key
+	// types with interface positions, where a rendered REF token could
+	// depend on it). The value-bytes phase runs a full scoped sub-marshal
+	// per pair it reaches (only pairs with equal skeletons get compared),
+	// so structurally equal pointer keys cost O(n log n·|V|) marshal work —
 	// a documented cost of canonical map encoding. A failing sub-marshal
 	// is not swallowed: the error (wrapped with the pair path) fails the
 	// encode before the map header is written.
 	type pair struct {
-		skel    []byte
+		rank    []uint64
 		k       reflect.Value
 		val     reflect.Value
 		valb    []byte
@@ -2037,6 +2643,8 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode) error {
 		}
 		return pr.valb
 	}
+	rw := e.rankWalker(e.keyTracksIntern(kp))
+	rw.beginMap()
 	pairs := make([]pair, 0, v.Len())
 	i := 0
 	for iter := v.MapRange(); iter.Next(); {
@@ -2045,11 +2653,13 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode) error {
 			return unsupportedAt("coder-coded dynamic map key type "+nameOf(k.Elem().Type()), p.String())
 		}
 		pn := pathNode{parent: &p, idx: i}
-		skel, err := skeletonKeyBytes(k, pn, e.skelScratch())
-		if err != nil {
+		rw.resetKey()
+		if err := rw.walk(k, pn); err != nil {
 			return err
 		}
-		pairs = append(pairs, pair{skel: skel, k: k, val: iter.Value()})
+		off := len(rw.arena)
+		rw.arena = append(rw.arena, rw.cells...)
+		pairs = append(pairs, pair{rank: rw.arena[off:], k: k, val: iter.Value()})
 		i++
 	}
 	keySeq := func(p *pair) []uintptr {
@@ -2065,7 +2675,7 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode) error {
 	}
 	slices.SortFunc(idx, func(a, b int32) int {
 		pa, pb := &pairs[a], &pairs[b]
-		if c := bytes.Compare(pa.skel, pb.skel); c != 0 {
+		if c := rankLess(pa.rank, pb.rank); c != 0 {
 			return c
 		}
 		if c := bytes.Compare(valBytes(pa), valBytes(pb)); c != 0 {
@@ -2084,7 +2694,7 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode) error {
 	// Intern record: register the id the header will take, so value
 	// positions inside the pairs REF this map mid-fill (record-then-fill,
 	// record semantics).
-	e.maps[v.Pointer()] = pinnedID{id: e.w.NextID(), v: v}
+	e.internMap(v.UnsafePointer(), e.w.NextID())
 	if err := e.w.WriteMapHeader(uint64(len(pairs))); err != nil {
 		return err
 	}
@@ -2138,7 +2748,7 @@ type bytesPair struct {
 // value/pointer tie-break phases are unreachable.
 func (e *codecEncoder) encodeStringMap(v reflect.Value, p pathNode) error {
 	m := v.Interface().(map[string]string)
-	ptr := v.Pointer()
+	mp := v.UnsafePointer()
 	pairs := make([]strPair, 0, len(m))
 	for k, val := range m {
 		pairs = append(pairs, strPair{k: k, v: val, form: wire.ArgForm(uint64(len(k))), n: len(k)})
@@ -2162,7 +2772,7 @@ func (e *codecEncoder) encodeStringMap(v reflect.Value, p pathNode) error {
 		pn := pathNode{parent: &p, idx: 0}
 		return errBudget(classBudgetDepth, -1, pn.String(), nil, e.lim.MaxDepth, errDetail(fmt.Sprintf("output depth exceeds MaxDepth budget %d", e.lim.MaxDepth)))
 	}
-	e.maps[ptr] = pinnedID{id: e.w.NextID(), v: v}
+	e.internMap(mp, e.w.NextID())
 	if err := e.w.WriteMapHeader(uint64(len(pairs))); err != nil {
 		return err
 	}
@@ -2203,7 +2813,7 @@ func (e *codecEncoder) encodeStringMap(v reflect.Value, p pathNode) error {
 // tie-break phases are unreachable here as well.
 func (e *codecEncoder) encodeBytesMap(v reflect.Value, p pathNode) error {
 	m := v.Interface().(map[string][]byte)
-	ptr := v.Pointer()
+	mp := v.UnsafePointer()
 	pairs := make([]bytesPair, 0, len(m))
 	for k, val := range m {
 		pairs = append(pairs, bytesPair{k: k, v: val})
@@ -2215,7 +2825,7 @@ func (e *codecEncoder) encodeBytesMap(v reflect.Value, p pathNode) error {
 		pn := pathNode{parent: &p, idx: 0}
 		return errBudget(classBudgetDepth, -1, pn.String(), nil, e.lim.MaxDepth, errDetail(fmt.Sprintf("output depth exceeds MaxDepth budget %d", e.lim.MaxDepth)))
 	}
-	e.maps[ptr] = pinnedID{id: e.w.NextID(), v: v}
+	e.internMap(mp, e.w.NextID())
 	if err := e.w.WriteMapHeader(uint64(len(pairs))); err != nil {
 		return err
 	}
@@ -2257,6 +2867,441 @@ func cmpLenPrefix(a, b string) int {
 		return 1
 	}
 	return strings.Compare(a, b)
+}
+
+// rankLess orders two rank-cell sequences lexicographically, a strict
+// prefix ranking below its extension — the same verdict bytes.Compare
+// returns on the skeleton byte streams the cells mirror.
+func rankLess(a, b []uint64) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// appendRankTokenArg appends the cells of an ARG-prefixed token: class
+// in the high nibble, minimal ARG form, big-endian payload — the cell
+// order equals the bytewise token order.
+func appendRankTokenArg(dst []uint64, class byte, n uint64) []uint64 {
+	f := wire.ArgForm(n)
+	dst = append(dst, uint64(class)<<4|uint64(f))
+	if f >= 0x0C {
+		return append(dst, n)
+	}
+	return dst
+}
+
+// appendRankBareArg appends the cells of a bare argument position — a
+// full first byte carrying the ARG form, then the payload: bigint value
+// bodies and descriptor width/length arguments.
+func appendRankBareArg(dst []uint64, n uint64) []uint64 {
+	f := wire.ArgForm(n)
+	dst = append(dst, uint64(f))
+	if f >= 0x0C {
+		return append(dst, n)
+	}
+	return dst
+}
+
+// appendRankPacked appends b as big-endian 64-bit cells, the final
+// partial cell zero-padded on the right; raw runs compare only at equal
+// length, so the padding never decides.
+func appendRankPacked(dst []uint64, b []byte) []uint64 {
+	for i := 0; i < len(b); i += 8 {
+		var c uint64
+		n := min(8, len(b)-i)
+		for j := range n {
+			c = c<<8 | uint64(b[i+j])
+		}
+		dst = append(dst, c<<(8*(8-n)))
+	}
+	return dst
+}
+
+func appendRankPackedString(dst []uint64, s string) []uint64 {
+	for i := 0; i < len(s); i += 8 {
+		var c uint64
+		n := min(8, len(s)-i)
+		for j := range n {
+			c = c<<8 | uint64(s[i+j])
+		}
+		dst = append(dst, c<<(8*(8-n)))
+	}
+	return dst
+}
+
+// zigzagRank maps a signed int64 onto unsigned values ordered by
+// magnitude: 0→0, -1→1, 1→2, -2→3, MinInt64→MaxUint64 (the wire INT
+// argument image; the wire package keeps its copy unexported).
+func zigzagRank(n int64) uint64 {
+	return uint64(n<<1) ^ uint64(n>>63)
+}
+
+// zigzagBigRank is the arbitrary-precision zigzag image: n ≥ 0 → 2n,
+// n < 0 → −2n−1.
+func zigzagBigRank(n *big.Int) *big.Int {
+	u := new(big.Int).Abs(n)
+	u.Lsh(u, 1)
+	if n.Sign() < 0 {
+		u.Sub(u, big.NewInt(1))
+	}
+	return u
+}
+
+// rankDescClaim is one claimed descriptor of the intern simulation: the
+// id a rendered REF would carry plus the structural signature used for
+// the name-rebound conflict check.
+type rankDescClaim struct {
+	id  uint64
+	sig []uint64
+}
+
+// rankWalker emits the rank cells of map keys — the integer mirror of
+// the canonical skeleton bytes. Interface-free key types never render
+// intern-dependent tokens, so the claim simulation is gated by track.
+type rankWalker struct {
+	cells      []uint64
+	arena      []uint64
+	track      bool
+	strs       map[string]uint64
+	descClaims map[string]rankDescClaim
+	nextID     uint64
+	sigMemo    map[*wire.Desc][]uint64
+	seen       map[uintptr]bool
+}
+
+// beginMap clears the per-map arena of rank cells handed out to pairs;
+// pair views of finished maps are dead by then, so the capacity is
+// reused across maps of the stream.
+func (rw *rankWalker) beginMap() {
+	rw.arena = rw.arena[:0]
+}
+
+// newRankWalker returns a walker in one mode, with the per-key state
+// allocated.
+func newRankWalker(track bool) *rankWalker {
+	rw := &rankWalker{
+		track: track,
+		seen:  make(map[uintptr]bool),
+	}
+	if track {
+		rw.strs = make(map[string]uint64)
+		rw.descClaims = make(map[string]rankDescClaim)
+		rw.sigMemo = make(map[*wire.Desc][]uint64)
+	}
+	return rw
+}
+
+// resetKey returns the walker to a fresh per-key state, mirroring the
+// per-key reset of the render scratch it replaces.
+func (rw *rankWalker) resetKey() {
+	rw.cells = rw.cells[:0]
+	clear(rw.seen)
+	if rw.track {
+		clear(rw.strs)
+		clear(rw.descClaims)
+		clear(rw.sigMemo)
+		rw.nextID = 0
+	}
+}
+
+// walk emits the rank cells of one key position with the same category
+// dispatch, cycle handling and rejects as the skeleton render pass.
+func (rw *rankWalker) walk(v reflect.Value, p pathNode) error {
+	switch v.Kind() {
+	case reflect.Bool:
+		c := uint64(0x10)
+		if v.Bool() {
+			c = 0x11
+		}
+		rw.cells = append(rw.cells, c)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		rw.cells = appendRankTokenArg(rw.cells, 0x2, zigzagRank(v.Int()))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		rw.cells = appendRankTokenArg(rw.cells, 0x3, v.Uint())
+	case reflect.Float32:
+		if math.IsNaN(v.Float()) {
+			return unsupportedAt("NaN map key component", p.String())
+		}
+		rw.cells = append(rw.cells, 0x40, uint64(math.Float32bits(float32(v.Float()))))
+	case reflect.Float64:
+		if math.IsNaN(v.Float()) {
+			return unsupportedAt("NaN map key component", p.String())
+		}
+		rw.cells = append(rw.cells, 0x41, math.Float64bits(v.Float()))
+	case reflect.Complex64, reflect.Complex128:
+		c := v.Complex()
+		if math.IsNaN(real(c)) || math.IsNaN(imag(c)) {
+			return unsupportedAt("NaN map key component", p.String())
+		}
+		if v.Kind() == reflect.Complex64 {
+			c64 := complex64(c)
+			rw.cells = append(rw.cells, 0x50,
+				uint64(math.Float32bits(real(c64)))<<32|uint64(math.Float32bits(imag(c64))))
+			break
+		}
+		rw.cells = append(rw.cells, 0x51, math.Float64bits(real(c)), math.Float64bits(imag(c)))
+	case reflect.String:
+		s := v.String()
+		if rw.track {
+			rw.strs[s] = rw.nextID
+			rw.nextID++
+		}
+		rw.cells = appendRankTokenArg(rw.cells, 0x6, uint64(len(s)))
+		rw.cells = appendRankPackedString(rw.cells, s)
+	case reflect.Pointer:
+		if v.Type() == bigIntPtrType {
+			// BIGINT keys: the skeleton is the literal value body —
+			// minimal bare/ext argument of the zigzag image (KO-6
+			// over the whole integer domain).
+			rw.rankBigint(v.Interface().(*big.Int))
+			break
+		}
+		if v.IsNil() || rw.seen[v.Pointer()] {
+			// A nil pointer and a cyclic repeat both collapse to the
+			// nil marker, keeping the rank sequence finite.
+			rw.cells = append(rw.cells, 0x00)
+			break
+		}
+		rw.seen[v.Pointer()] = true
+		return rw.walk(v.Elem(), p)
+	case reflect.Interface:
+		if v.IsNil() {
+			rw.cells = append(rw.cells, 0x03)
+			break
+		}
+		dv := v.Elem()
+		if !comparableKeyKind(dv.Type().Kind()) {
+			return unsupportedAt("unhashable map key dynamic type "+nameOf(dv.Type()), p.String())
+		}
+		d, err := descOf(dv.Type(), p.String())
+		if err != nil {
+			return err
+		}
+		if err := rw.rankDesc(d); err != nil {
+			return err
+		}
+		return rw.walk(dv, p)
+	case reflect.Array:
+		E := densePrefix(v)
+		if rw.track {
+			rw.nextID++ // the array header claims an intern id at its record
+		}
+		rw.cells = appendRankTokenArg(rw.cells, 0x8, uint64(v.Len()))
+		rw.cells = appendRankBareArg(rw.cells, E)
+		for i := range E {
+			en := pathNode{parent: &p, idx: int(i)}
+			if err := rw.walk(v.Index(int(i)), en); err != nil {
+				return err
+			}
+		}
+	case reflect.Struct:
+		rw.cells = append(rw.cells, 0xB0)
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.Name == "_" {
+				continue // blank: excluded from ==, KO-6
+			}
+			if f.PkgPath != "" {
+				fn := pathNode{parent: &p, name: f.Name, idx: -1}
+				return unsupportedAt("unexported field "+f.Name, fn.String())
+			}
+			fn := pathNode{parent: &p, name: f.Name, idx: -1}
+			if err := rw.walk(v.Field(i), fn); err != nil {
+				return err
+			}
+		}
+	default:
+		return unsupportedAt("map key kind "+v.Kind().String(), p.String())
+	}
+	return nil
+}
+
+// rankBigint appends the cells of the bigint value body: the bare
+// minimal argument of the zigzag image (inline/width below 2^64, the ext
+// form above; nil is the nil selector, byte-identical to the inline zero).
+func (rw *rankWalker) rankBigint(v *big.Int) {
+	if v == nil {
+		rw.cells = append(rw.cells, 0x00)
+		return
+	}
+	u := zigzagBigRank(v)
+	if u.IsUint64() {
+		rw.cells = appendRankBareArg(rw.cells, u.Uint64())
+		return
+	}
+	b := u.Bytes()
+	rw.cells = append(rw.cells, 0x10)
+	rw.cells = appendRankBareArg(rw.cells, uint64(len(b)))
+	rw.cells = appendRankPacked(rw.cells, b)
+}
+
+// rankDescConflict mirrors the wire Writer's descriptor name-rebound
+// rejection (the rank walk reaches the conflict before any bytes are
+// written, like the render it replaces).
+func rankDescConflict(name string) error {
+	return &wire.Error{
+		Kind: classRegisterConflict,
+		Off:  -1,
+		Got:  name,
+		Msg:  "gbon/wire: descriptor name rebound to a structurally different type: distinct types sharing one name are ambiguous (qualify the module path)",
+	}
+}
+
+// rankDesc appends the cells of a type-ref position: a REF on a claim
+// hit, a DESC literal otherwise; the claim simulation mirrors the
+// writer's intern state for the REF-vs-literal and id verdicts.
+func (rw *rankWalker) rankDesc(d *wire.Desc) error {
+	if cl, ok := rw.descClaims[d.Name]; ok {
+		if !slices.Equal(cl.sig, rw.descSignature(d)) {
+			return rankDescConflict(d.Name)
+		}
+		rw.cells = appendRankTokenArg(rw.cells, 0xC, cl.id)
+		return nil
+	}
+	id := rw.nextID
+	rw.nextID++
+	rw.descClaims[d.Name] = rankDescClaim{id: id, sig: rw.descSignature(d)}
+	if d.Kind <= 11 {
+		rw.cells = append(rw.cells, 0xD0|uint64(d.Kind))
+	} else {
+		rw.cells = append(rw.cells, 0xDC, uint64(d.Kind))
+	}
+	rw.rankDescName(d.Name)
+	switch d.Kind {
+	case wire.KindStruct:
+		rw.cells = appendRankBareArg(rw.cells, uint64(len(d.Fields)))
+		for _, f := range d.Fields {
+			rw.rankDescName(f.Name)
+			if err := rw.rankDesc(f.Type); err != nil {
+				return err
+			}
+		}
+	case wire.KindSlice, wire.KindPointer, wire.KindNamed:
+		return rw.rankDesc(d.Refs[0])
+	case wire.KindArray:
+		rw.cells = appendRankBareArg(rw.cells, d.Len)
+		return rw.rankDesc(d.Refs[0])
+	case wire.KindMap:
+		if err := rw.rankDesc(d.Refs[0]); err != nil {
+			return err
+		}
+		return rw.rankDesc(d.Refs[1])
+	case wire.KindInt, wire.KindUint, wire.KindFloat, wire.KindComplex:
+		rw.cells = appendRankBareArg(rw.cells, d.Width)
+	case wire.KindCoder:
+		rw.cells = appendRankBareArg(rw.cells, d.Tag)
+	case wire.KindBool, wire.KindInterface, wire.KindString, wire.KindBlob, wire.KindBigint:
+	}
+	return nil
+}
+
+// rankDescName appends the cells of an interned string position inside a
+// descriptor: a REF when the value is already claimed, the literal plus
+// the claim otherwise.
+func (rw *rankWalker) rankDescName(s string) {
+	if id, ok := rw.strs[s]; ok {
+		rw.cells = appendRankTokenArg(rw.cells, 0xC, id)
+		return
+	}
+	rw.strs[s] = rw.nextID
+	rw.nextID++
+	rw.cells = appendRankTokenArg(rw.cells, 0x6, uint64(len(s)))
+	rw.cells = appendRankPackedString(rw.cells, s)
+}
+
+// descSignature returns the structure-identifying cells of a
+// descriptor: its literal rendering from an empty intern state, back
+// edges collapsed to a fixed REF cell.
+func (rw *rankWalker) descSignature(d *wire.Desc) []uint64 {
+	if s, ok := rw.sigMemo[d]; ok {
+		return s
+	}
+	var out []uint64
+	claimed := make(map[string]bool)
+	var rec func(d *wire.Desc)
+	rec = func(d *wire.Desc) {
+		if claimed[d.Name] {
+			out = append(out, 0xC0)
+			return
+		}
+		claimed[d.Name] = true
+		if d.Kind <= 11 {
+			out = append(out, 0xD0|uint64(d.Kind))
+		} else {
+			out = append(out, 0xDC, uint64(d.Kind))
+		}
+		out = appendRankTokenArg(out, 0x6, uint64(len(d.Name)))
+		out = appendRankPackedString(out, d.Name)
+		switch d.Kind {
+		case wire.KindStruct:
+			out = appendRankBareArg(out, uint64(len(d.Fields)))
+			for _, f := range d.Fields {
+				out = appendRankTokenArg(out, 0x6, uint64(len(f.Name)))
+				out = appendRankPackedString(out, f.Name)
+				rec(f.Type)
+			}
+		case wire.KindSlice, wire.KindPointer, wire.KindNamed:
+			rec(d.Refs[0])
+		case wire.KindArray:
+			out = appendRankBareArg(out, d.Len)
+			rec(d.Refs[0])
+		case wire.KindMap:
+			rec(d.Refs[0])
+			rec(d.Refs[1])
+		case wire.KindInt, wire.KindUint, wire.KindFloat, wire.KindComplex:
+			out = appendRankBareArg(out, d.Width)
+		case wire.KindCoder:
+			out = appendRankBareArg(out, d.Tag)
+		case wire.KindBool, wire.KindInterface, wire.KindString, wire.KindBlob, wire.KindBigint:
+		}
+	}
+	rec(d)
+	rw.sigMemo[d] = out
+	return out
+}
+
+// planHasInterface reports whether the plan subtree covers an interface
+// position — the only key positions whose skeleton render consults
+// intern state. A nil plan conservatively reports true.
+func planHasInterface(pl *typePlan) bool {
+	if pl == nil {
+		return true
+	}
+	seen := make(map[*typePlan]bool)
+	var rec func(p *typePlan) bool
+	rec = func(p *typePlan) bool {
+		if p == nil || seen[p] {
+			return false
+		}
+		seen[p] = true
+		switch p.op {
+		case opInterface:
+			return true
+		case opArray, opPointer:
+			return rec(p.elem)
+		case opStruct:
+			for i := range p.fields {
+				if rec(p.fields[i].child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return rec(pl)
 }
 
 // skeletonScratch is the reused state of the canonical-key render: the
@@ -2456,10 +3501,14 @@ func (e *codecEncoder) encodePointer(v reflect.Value, p pathNode) error {
 		return e.w.WriteNil(wire.NilPointer)
 	}
 	if v.Type().Elem().Size() != 0 {
-		if ent, hit := e.ptrs[v.Pointer()]; hit {
-			return e.w.WriteRef(ent.id)
+		p := v.UnsafePointer()
+		k := uintptr(p)
+		if ent, hit := e.ptrs[k]; hit {
+			if id, live := e.alive(k, ent, e.ptrs); live {
+				return e.w.WriteRef(id)
+			}
 		}
-		e.ptrs[v.Pointer()] = pinnedID{id: e.w.ReserveID(), v: v}
+		e.internPtr(p, e.w.ReserveID())
 	}
 	return e.encodeBody(v.Elem(), p)
 }

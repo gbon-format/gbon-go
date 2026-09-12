@@ -11,6 +11,7 @@ package wire
 import (
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"reflect"
 	"strings"
@@ -130,12 +131,118 @@ const (
 	entryBlob
 )
 
+// internTable is the Writer-side string intern space: an
+// open-addressed power-of-two table, linear probing, exact membership
+// (probe hits verify hash then full string). The zero value is ready.
+type internTable struct {
+	slots []internSlot
+	mask  uint64
+	count int
+}
+
+// internSlot is one probe slot: the interned string, its seed hash
+// (computed once, on insertion), and the id biased by one — zero
+// marks the empty slot (empty string and id 0 are both valid).
+type internSlot struct {
+	s       string
+	hash    uint64
+	idPlus1 uint64
+}
+
+// internSeed randomizes probe order per process: the table determines
+// only performance — never membership or ids — so a runtime seed is
+// safe for output determinism.
+var internSeed = maphash.MakeSeed()
+
+// internSlotsInit is the slot count of a table's first allocation (a
+// power of two).
+const internSlotsInit = 8
+
+// internLoadDiv is the load-factor denominator: the table doubles once
+// entries would exceed capacity - capacity/4, keeping linear-probe
+// chains short while the slot array stays dense.
+const internLoadDiv = 4
+
+// get returns the id bound to s, reporting whether s is interned.
+func (t *internTable) get(s string) (uint64, bool) {
+	if t.count == 0 {
+		return 0, false
+	}
+	h := maphash.String(internSeed, s)
+	for i := h & t.mask; ; i = (i + 1) & t.mask {
+		slot := &t.slots[i]
+		if slot.idPlus1 == 0 {
+			return 0, false
+		}
+		if slot.hash == h && slot.s == s {
+			return slot.idPlus1 - 1, true
+		}
+	}
+}
+
+// set binds s to id; a slot for s takes the new id (one entry per
+// key, the newest id wins).
+func (t *internTable) set(s string, id uint64) {
+	if len(t.slots) == 0 {
+		t.rehash(internSlotsInit)
+	} else if t.count+1 > len(t.slots)-len(t.slots)/internLoadDiv {
+		t.rehash(len(t.slots) * 2)
+	}
+	h := maphash.String(internSeed, s)
+	for i := h & t.mask; ; i = (i + 1) & t.mask {
+		slot := &t.slots[i]
+		if slot.idPlus1 == 0 {
+			slot.s, slot.hash, slot.idPlus1 = s, h, id+1
+			t.count++
+			return
+		}
+		if slot.hash == h && slot.s == s {
+			slot.idPlus1 = id + 1
+			return
+		}
+	}
+}
+
+// insert claims a slot for s without growth checks; rehash
+// preconditions the table with spare capacity.
+func (t *internTable) insert(s string, h uint64, id uint64) {
+	for i := h & t.mask; ; i = (i + 1) & t.mask {
+		slot := &t.slots[i]
+		if slot.idPlus1 == 0 {
+			slot.s, slot.hash, slot.idPlus1 = s, h, id+1
+			t.count++
+			return
+		}
+	}
+}
+
+// rehash resizes the slot array to n slots (a power of two) and
+// reinserts every entry from its stored hash; ids are carried over
+// unchanged.
+func (t *internTable) rehash(n int) {
+	old := t.slots
+	t.slots = make([]internSlot, n)
+	t.mask = uint64(n - 1)
+	t.count = 0
+	for i := range old {
+		if old[i].idPlus1 != 0 {
+			t.insert(old[i].s, old[i].hash, old[i].idPlus1-1)
+		}
+	}
+}
+
+// clear drops all entries, retaining the slot array for reuse.
+func (t *internTable) clear() {
+	clear(t.slots)
+	t.count = 0
+}
+
 // Writer encodes token-level records into a byte stream. Interning (strings,
 // descriptors) is per Writer; identity keys for arrays, blobs, and pointer
 // targets are a codec-layer concern.
 type Writer struct {
 	buf    []byte
-	strs   map[string]uint64
+	strs   internTable
 	descs  map[string]descClaim
 	nextID uint64
 }
@@ -143,7 +250,6 @@ type Writer struct {
 // NewWriter returns a Writer with empty intern tables.
 func NewWriter() *Writer {
 	return &Writer{
-		strs:  make(map[string]uint64),
 		descs: make(map[string]descClaim),
 	}
 }
@@ -159,7 +265,7 @@ const maxPooledCap = 4 << 20
 // counter zeroed, buffer retained up to maxPooledCap — for reuse by a
 // subsequent self-contained stream. Token output is unaffected.
 func (w *Writer) Reset() {
-	clear(w.strs)
+	w.strs.clear()
 	clear(w.descs)
 	w.nextID = 0
 	if cap(w.buf) > maxPooledCap {

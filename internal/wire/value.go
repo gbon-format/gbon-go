@@ -287,7 +287,7 @@ func (r *Reader) ReadComplex128() (complex128, error) {
 // any bytes, no UTF-8 gate. The string is registered in the intern space
 // on first encounter.
 func (w *Writer) WriteStringLit(s string) error {
-	w.strs[s] = w.allocID()
+	w.strs.set(s, w.allocID())
 	w.writeTokenArg(classString, uint64(len(s)))
 	w.buf = append(w.buf, s...)
 	return nil
@@ -296,7 +296,7 @@ func (w *Writer) WriteStringLit(s string) error {
 // WriteString writes a string position: REF on repeated encounter, literal
 // on first.
 func (w *Writer) WriteString(s string) error {
-	if id, ok := w.strs[s]; ok {
+	if id, ok := w.strs.get(s); ok {
 		return w.WriteRef(id)
 	}
 	return w.WriteStringLit(s)
