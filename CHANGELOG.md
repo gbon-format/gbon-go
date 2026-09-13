@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Decoder conforms to the slot-rooted record reference of the cell
+  model: a whole-value REF from a `*T` pointer position naming the slot cell of
+  a named record whose leading field carries the interface grain
+  decodes through the container grain (the cell materializes as `*T`,
+  the slot is the leading field's storage), closing named slot-root
+  rings that previously failed `bad_ref`; the encoder and existing
+  streams are untouched, and the conformance corpus grows six vectors
+  (V-100..V-105) with the reader-side builder binding.
+
 One optimization program, wire format unchanged throughout: encoded
 output is byte-identical across every change below, while encoding
 allocates less across the corpus, primitive-heavy shapes encode

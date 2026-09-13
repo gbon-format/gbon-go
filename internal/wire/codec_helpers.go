@@ -185,6 +185,85 @@ func (r *Reader) PeekRef() (uint64, bool) {
 	return r.peekID, true
 }
 
+// peekNameCap bounds the name lookahead: descriptor names are type
+// identifiers, far below this magnitude; a longer declared length is
+// treated as a non-DESC lookahead outcome rather than buffered.
+const peekNameCap = 1 << 16
+
+// PeekDesc returns the kind and literal name of a DESC-literal header
+// without consuming or interning; ok=false covers non-DESC lookahead
+// outcomes and malformed or oversized extents; the fill is exact.
+func (r *Reader) PeekDesc() (Kind, string, bool) {
+	if class, err := r.peekFirst(); err != nil || class != classDesc {
+		return 0, "", false
+	}
+	hdr := 1
+	form := r.buf[r.pos] & 0x0F
+	var kind Kind
+	switch {
+	case form <= 11:
+		kind = Kind(form)
+	case form == argU8:
+		if r.src != nil {
+			if err := r.fill(2); err != nil {
+				return 0, "", false
+			}
+		}
+		if r.pos+1 >= len(r.buf) {
+			return 0, "", false
+		}
+		k := Kind(r.buf[r.pos+1])
+		if k < 12 || k >= maxKind {
+			return 0, "", false
+		}
+		kind, hdr = k, 2
+	default:
+		return 0, "", false
+	}
+	nx := r.pos + hdr
+	if r.src != nil {
+		if err := r.fill(hdr + 1); err != nil {
+			return 0, "", false
+		}
+	}
+	if nx >= len(r.buf) || r.buf[nx]>>4 != classString {
+		return 0, "", false
+	}
+	sform := r.buf[nx] & 0x0F
+	aw := argWidth(sform)
+	if r.src != nil && aw > 0 {
+		if err := r.fill(hdr + 1 + aw); err != nil {
+			return 0, "", false
+		}
+	}
+	var n uint64
+	if sform <= byte(argInlineMax) {
+		n = uint64(sform)
+	} else if sform >= argU8 && sform <= argU64 {
+		if nx+1+aw > len(r.buf) {
+			return 0, "", false
+		}
+		for _, c := range r.buf[nx+1 : nx+1+aw] {
+			n = n<<8 | uint64(c)
+		}
+	} else {
+		return 0, "", false
+	}
+	if n > peekNameCap {
+		return 0, "", false
+	}
+	if r.src != nil {
+		if err := r.fill(hdr + 1 + aw + int(n)); err != nil {
+			return 0, "", false
+		}
+	}
+	end := nx + 1 + aw + int(n)
+	if end > len(r.buf) {
+		return 0, "", false
+	}
+	return kind, string(r.buf[nx+1+aw : end]), true
+}
+
 // PeekNilKind returns the selector of a NIL-class token at the current
 // position without consuming it; ok=false on any other lookahead
 // outcome, including unknown selectors.

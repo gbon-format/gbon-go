@@ -941,6 +941,46 @@ func TestRingNegativeOutcomes(t *testing.T) {
 	if !errors.As(err, &ge) || ge.Class() != "bad_ref" {
 		t.Fatalf("cell mismatch: class %v", err)
 	}
+
+	// a slot cell named from a struct-pointer position whose leading
+	// field does not carry the slot element type stays bad_ref, literal
+	// text included
+	s4 := &rgS1{}
+	s4.F1 = s4
+	b4 := mustMarshal(t, &s4.F1)
+	dec4 := gbon.NewDecoder(bytes.NewReader(b4))
+	if err := dec4.Register(new(any)); err != nil {
+		t.Fatal(err)
+	}
+	wireName := func(t reflect.Type) string { return t.PkgPath() + "." + t.String() }
+	if err := dec4.RegisterAs("*"+wireName(reflect.TypeFor[rgS1]()), new(rgLeadInt)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dec4.RegisterAs(wireName(reflect.TypeFor[rgS1]()), rgLeadInt{}); err != nil {
+		t.Fatal(err)
+	}
+	var w1 any
+	err = dec4.Decode(&w1)
+	if !errors.As(err, &ge) || ge.Class() != "bad_ref" {
+		t.Fatalf("lead mismatch: %v", err)
+	}
+	if want := fmt.Sprintf("ref 4 is not a %s target", reflect.TypeFor[*rgLeadInt]()); !strings.Contains(err.Error(), want) {
+		t.Fatalf("lead mismatch: text %q, want %q", err.Error(), want)
+	}
+
+	// a REF to a string record in a pointer position stays bad_ref, literal
+	// text included
+	c5 := newCraft()
+	c5.descPos(dPtr(dIface))
+	strRec := craftRec{id: 3} // the interface descriptor's name string record
+	c5.refTok(strRec)
+	err = gbon.NewDecoder(bytes.NewReader(c5.buf)).Decode(new(*any))
+	if !errors.As(err, &ge) || ge.Class() != "bad_ref" {
+		t.Fatalf("foreign sort: %v", err)
+	}
+	if want := fmt.Sprintf("wire: ref %d is not an object record", strRec.id); !strings.Contains(err.Error(), want) {
+		t.Fatalf("foreign sort: text %q, want %q", err.Error(), want)
+	}
 }
 
 // ringGraphIsomorphic asserts decoded-graph equivalence to the source:
@@ -1264,3 +1304,387 @@ func TestRingPropertyOrderIndependence(t *testing.T) {
 		}
 	}
 }
+
+// Named slot-root forms: a REF naming the storage record of a leading
+// any-field (the slot at offset zero of its node) serves pointer
+// positions through the container grain.
+type rgS1 struct{ F1 any }
+
+// slotrootDecodeAs decodes b over the probe registration set into target.
+func slotrootDecodeAs(t *testing.T, b []byte, target any) {
+	t.Helper()
+	dec := gbon.NewDecoder(bytes.NewReader(b))
+	if err := dec.Register(new(any), new(rgS1), new(*rgS1), new([]any), new(rgAB), new(*rgAB)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dec.Decode(target); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+// slotrootDecode decodes b over the probe registration set.
+func slotrootDecode(t *testing.T, b []byte) any {
+	t.Helper()
+	var out any
+	dec := gbon.NewDecoder(bytes.NewReader(b))
+	if err := dec.Register(new(any), new(rgS1), new(*rgS1), new([]any), new(rgAB), new(*rgAB)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dec.Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return out
+}
+
+// slotrootSelfRing asserts the named self-ring closure: the root lands
+// on a *any pointing at the node's leading field storage, and the node's
+// field content closes the ring on the node pointer itself.
+func slotrootSelfRing(t *testing.T, label string, out any) {
+	t.Helper()
+	p1, ok := out.(*any)
+	if !ok || p1 == nil {
+		t.Fatalf("%s: root %T, want *any", label, out)
+	}
+	node, ok := (*p1).(*rgS1)
+	if !ok {
+		t.Fatalf("%s: slot content %T, want *rgS1", label, *p1)
+	}
+	if node.F1.(*rgS1) != node {
+		t.Fatalf("%s: ring open: node %p field holds %p", label, node, node.F1.(*rgS1))
+	}
+	if got, want := reflect.ValueOf(p1).Pointer(), reflect.ValueOf(node).Elem().Field(0).Addr().Pointer(); got != want {
+		t.Fatalf("%s: slot-root storage %d, want the node's leading field %d", label, got, want)
+	}
+}
+
+// TestRingSlotrootMatrix walks the G-form matrix over named records:
+// the slot-root forms (G1/G2/G7) pin their current decode outcome, the
+// controls (G3-G6/G8) stay green round-trips with byte-stable re-encode.
+func TestRingSlotrootMatrix(t *testing.T) {
+	build := func(form string) any {
+		switch form {
+		case "G1":
+			s := &rgS1{}
+			s.F1 = s
+			return &s.F1
+		case "G2":
+			s := &rgS1{}
+			s.F1 = s
+			x := &s.F1
+			return &x
+		case "G3":
+			u := &rgS1{}
+			u.F1 = &u.F1
+			return &u.F1
+		case "G4":
+			n := &rgS1{}
+			n.F1 = &rgS1{}
+			return &n.F1
+		case "G5":
+			s := &rgS1{}
+			s.F1 = s
+			return s
+		case "G6":
+			sl := make([]any, 1)
+			s := &rgS1{}
+			s.F1 = s
+			sl[0] = s
+			return &sl[0]
+		case "G7":
+			p := &rgS1{}
+			q := &rgS1{}
+			p.F1 = q
+			q.F1 = p
+			return &p.F1
+		case "G8":
+			s := &rgS1{}
+			s.F1 = s
+			var slot any = s
+			return &slot
+		}
+		t.Fatalf("unknown form %s", form)
+		return nil
+	}
+	for _, form := range []string{"G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"} {
+		t.Run(form, func(t *testing.T) {
+			src := build(form)
+			b := mustMarshal(t, src)
+			dec := gbon.NewDecoder(bytes.NewReader(b))
+			if err := dec.Register(new(any), new(rgS1), new(*rgS1), new([]any), new(rgAB), new(*rgAB)); err != nil {
+				t.Fatal(err)
+			}
+			var out any
+			err := dec.Decode(&out)
+			if err != nil {
+				t.Fatalf("%s: decode: %v", form, err)
+			}
+			ringAssertBytes(t, src, out, b)
+			switch form {
+			case "G1", "G2":
+				if form == "G2" {
+					pp, ok := out.(**any)
+					if !ok || pp == nil {
+						t.Fatalf("G2: root %T, want **any", out)
+					}
+					out = *pp
+				}
+				slotrootSelfRing(t, form, out)
+			case "G7":
+				p1, ok := out.(*any)
+				if !ok || p1 == nil {
+					t.Fatalf("G7: root %T, want *any", out)
+				}
+				q, ok := (*p1).(*rgS1)
+				if !ok {
+					t.Fatalf("G7: slot content %T, want *rgS1", *p1)
+				}
+				p := q.F1.(*rgS1)
+				if p.F1.(*rgS1) != q {
+					t.Fatalf("G7: two-ring open")
+				}
+				if got, want := reflect.ValueOf(p1).Pointer(), reflect.ValueOf(p).Elem().Field(0).Addr().Pointer(); got != want {
+					t.Fatalf("G7: slot-root storage %d, want the p-node's leading field %d", got, want)
+				}
+			default:
+				switch form {
+				case "G3":
+					p1 := out.(*any)
+					if inner := (*p1).(*any); inner != p1 {
+						t.Fatalf("G3: ring open: %p vs %p", inner, p1)
+					}
+				case "G4":
+					if n := (*out.(*any)).(*rgS1); n.F1 != nil {
+						t.Fatalf("G4: DAG leaf field %v, want nil", n.F1)
+					}
+				case "G5":
+					if s := out.(*rgS1); s.F1.(*rgS1) != s {
+						t.Fatalf("G5: ring open")
+					}
+				case "G6", "G8":
+					node := (*out.(*any)).(*rgS1)
+					if node.F1.(*rgS1) != node {
+						t.Fatalf("%s: ring open", form)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Property: named any-slot graphs round-trip across slot-root
+// modalities and target grains with the same normalized pointer walk.
+func TestRingPropertyNamedSlotrootModality(t *testing.T) {
+	rnd := rand.New(rand.NewSource(20260914))
+	for iter := range 40 {
+		n := 1 + rnd.Intn(5)
+		nodes := make([]*rgAB, n)
+		for i := range nodes {
+			nodes[i] = &rgAB{}
+		}
+		for i := range nodes {
+			nodes[i].Box = nodes[rnd.Intn(n)]
+		}
+		// normalize renders the slot-walk as first-seen indices ending
+		// at the first repeat, so source and decode compare on shape
+		normalize := func(start *any) []int {
+			idx := map[*any]int{start: 0}
+			seq := []int{0}
+			cur := start
+			for {
+				node := (*cur).(*rgAB)
+				next := reflect.ValueOf(node.Box.(*rgAB)).Elem().Field(0).Addr().Interface().(*any)
+				if v, ok := idx[next]; ok {
+					seq = append(seq, v)
+					return seq
+				}
+				idx[next] = len(idx)
+				seq = append(seq, len(idx)-1)
+				cur = next
+			}
+		}
+		wantSeq := normalize(&nodes[0].Box)
+		box := &nodes[0].Box
+		cell := reflect.New(reflect.TypeFor[*any]()).Elem()
+		cell.Set(reflect.ValueOf(box))
+		for _, mod := range []struct {
+			label string
+			src   any
+		}{
+			{"slot-root", box},
+			{"double-slot-root", cell.Addr().Interface()},
+		} {
+			b := mustMarshal(t, mod.src)
+			var oAny any
+			slotrootDecodeAs(t, b, &oAny)
+			root := oAny
+			if mod.label == "double-slot-root" {
+				pp, ok := oAny.(**any)
+				if !ok || pp == nil {
+					t.Fatalf("iter %d %s: root %T, want **any", iter, mod.label, oAny)
+				}
+				root = *pp
+			}
+			p1, ok := root.(*any)
+			if !ok || p1 == nil {
+				t.Fatalf("iter %d %s: entry %T, want *any", iter, mod.label, root)
+			}
+			got := 0
+			cur := p1
+			for {
+				node, ok := (*cur).(*rgAB)
+				if !ok {
+					t.Fatalf("iter %d %s: slot content %T, want *rgAB", iter, mod.label, *cur)
+				}
+				got++
+				next := reflect.ValueOf(node.Box.(*rgAB)).Elem().Field(0).Addr().Interface().(*any)
+				if next == p1 || got > len(wantSeq) {
+					break
+				}
+				cur = next
+			}
+			if n := normalize(p1); !reflect.DeepEqual(n, wantSeq) {
+				t.Fatalf("iter %d %s: walk %v, want %v", iter, mod.label, n, wantSeq)
+			}
+			var oPtr *any
+			var oDbl **any
+			if mod.label == "slot-root" {
+				slotrootDecodeAs(t, b, &oPtr)
+				ringAssertBytes(t, mod.src, oPtr, b)
+			} else {
+				slotrootDecodeAs(t, b, &oDbl)
+				if oDbl == nil || *oDbl == nil {
+					t.Fatalf("iter %d %s: nil double root", iter, mod.label)
+				}
+				ringAssertBytes(t, mod.src, oDbl, b)
+			}
+			ringAssertBytes(t, mod.src, oAny, b)
+		}
+	}
+}
+
+// Property: a cross pair of named nodes entered from either slot-root
+// decodes to consistent graphs — the entry points agree on topology
+// and each walk closes on its own node identity.
+func TestRingPropertyNamedSlotrootCrossModality(t *testing.T) {
+	rnd := rand.New(rand.NewSource(20260915))
+	for iter := range 40 {
+		p := &rgAB{}
+		q := &rgAB{}
+		if rnd.Intn(2) == 0 {
+			p.Box, q.Box = q, p
+		} else {
+			p.Box, q.Box = p, q
+		}
+		for _, entry := range []struct {
+			label string
+			src   *any
+		}{
+			{"p", &p.Box},
+			{"q", &q.Box},
+		} {
+			b := mustMarshal(t, entry.src)
+			out := slotrootDecode(t, b)
+			p1, ok := out.(*any)
+			if !ok || p1 == nil {
+				t.Fatalf("iter %d %s: root %T, want *any", iter, entry.label, out)
+			}
+			first := (*p1).(*rgAB)
+			second := first.Box.(*rgAB)
+			if second.Box.(*rgAB) != first {
+				t.Fatalf("iter %d %s: two-ring open", iter, entry.label)
+			}
+			if got, want := reflect.ValueOf(p1).Pointer(), reflect.ValueOf(second).Elem().Field(0).Addr().Pointer(); got != want {
+				t.Fatalf("iter %d %s: slot-root storage %d, want the closure node's leading field %d", iter, entry.label, got, want)
+			}
+			ringAssertBytes(t, entry.src, out, b)
+		}
+	}
+}
+
+// The root-REF matrix over typed targets: green pairs round-trip with
+// stable bytes, grain-incompatible pairs fail loud type_mismatch, and
+// no outcome ever reaches the root-ref error text.
+func TestRingSlotrootTypedTargetMatrix(t *testing.T) {
+	build := func(form string) any {
+		switch form {
+		case "G1":
+			s := &rgS1{}
+			s.F1 = s
+			return &s.F1
+		case "G2":
+			s := &rgS1{}
+			s.F1 = s
+			x := &s.F1
+			return &x
+		case "G7":
+			p := &rgS1{}
+			q := &rgS1{}
+			p.F1 = q
+			q.F1 = p
+			return &p.F1
+		case "G5":
+			s := &rgS1{}
+			s.F1 = s
+			return s
+		}
+		t.Fatalf("unknown form %s", form)
+		return nil
+	}
+	decode := func(t *testing.T, b []byte, target any) error {
+		dec := gbon.NewDecoder(bytes.NewReader(b))
+		if err := dec.Register(new(any), new(rgS1), new(*rgS1), new([]any), new(rgAB), new(*rgAB)); err != nil {
+			t.Fatal(err)
+		}
+		return dec.Decode(target)
+	}
+	for _, form := range []string{"G1", "G2", "G7", "G5"} {
+		b := mustMarshal(t, build(form))
+		for _, tc := range []struct {
+			label string
+			green bool
+			gap   bool
+			value bool
+			mk    func() any
+		}{
+			{"&any", true, false, false, func() any { return new(any) }},
+			{"&*any", form != "G2" && form != "G5", false, false, func() any { return new(*any) }},
+			{"&**any", form != "G5", form != "G2", false, func() any { return new(**any) }},
+			{"&rgS1", form == "G5", false, true, func() any { return new(rgS1) }},
+			{"&*rgS1", form == "G5", false, false, func() any { return new(*rgS1) }},
+		} {
+			t.Run(form+"x"+tc.label, func(t *testing.T) {
+				target := tc.mk()
+				err := decode(t, b, target)
+				if strings.Contains(fmt.Sprint(err), "root ref") {
+					t.Fatalf("%s x %s reached the root-ref text: %v", form, tc.label, err)
+				}
+				if tc.green {
+					if err != nil {
+						t.Fatalf("%s x %s: %v", form, tc.label, err)
+					}
+					got := reflect.ValueOf(target).Elem().Interface()
+					if tc.value {
+						got = reflect.ValueOf(target).Elem().Addr().Interface()
+					}
+					if tc.gap {
+						// a synthesized level re-encodes to its own stable wire
+						re := mustMarshal(t, got)
+						var again **any
+						if err := decode(t, re, &again); err != nil {
+							t.Fatalf("%s x %s: synthesized re-decode: %v", form, tc.label, err)
+						}
+						ringAssertBytes(t, got, again, re)
+						return
+					}
+					ringAssertBytes(t, build(form), got, b)
+				} else if err == nil {
+					t.Fatalf("%s x %s: grain-incompatible pair decoded", form, tc.label)
+				}
+			})
+		}
+	}
+}
+
+// rgLeadInt is the leading-field mismatch shape: its first field is not
+// the any slot the named record was materialized at.
+type rgLeadInt struct{ F0 int64 }

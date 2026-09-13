@@ -727,16 +727,9 @@ func (d *codecDecoder) decodeBody(desc *wire.Desc, target reflect.Value, p pathN
 	if target.Kind() == reflect.Interface && desc.Kind != wire.KindInterface {
 		return d.resolveConcrete(desc, target, p)
 	}
-	d.depth++
-	defer func() { d.depth-- }()
-	if d.depth > d.maxDepth {
-		return d.fail(errBudget(classBudgetDepth, d.r.Pos(), p.String(), nil, d.maxDepth, errDetail(fmt.Sprintf("value nesting exceeds depth budget MaxDepth=%d", d.maxDepth))))
-	}
-	d.nodes++
-	if d.nodes > d.maxNodes {
-		return d.fail(errBudget(classBudgetNodes, d.r.Pos(), p.String(), nil, d.maxNodes, errDetail(fmt.Sprintf("value materializes more nodes than MaxNodes=%d", d.maxNodes))))
-	}
-	if err := d.checkBytes(p); err != nil {
+	restore, err := d.chargeValueBody(p)
+	defer restore()
+	if err != nil {
 		return err
 	}
 	switch desc.Kind {
@@ -2428,6 +2421,22 @@ func descPtrDepth(desc *wire.Desc) (int, bool) {
 	}
 }
 
+// chargeValueBody applies the per-body budget steps: subtree depth
+// (paired with the returned restore), the cumulative node count, and
+// the byte-window check.
+func (d *codecDecoder) chargeValueBody(p pathNode) (restore func(), err error) {
+	d.depth++
+	restore = func() { d.depth-- }
+	if d.depth > d.maxDepth {
+		return restore, d.fail(errBudget(classBudgetDepth, d.r.Pos(), p.String(), nil, d.maxDepth, errDetail(fmt.Sprintf("value nesting exceeds depth budget MaxDepth=%d", d.maxDepth))))
+	}
+	d.nodes++
+	if d.nodes > d.maxNodes {
+		return restore, d.fail(errBudget(classBudgetNodes, d.r.Pos(), p.String(), nil, d.maxNodes, errDetail(fmt.Sprintf("value materializes more nodes than MaxNodes=%d", d.maxNodes))))
+	}
+	return restore, d.checkBytes(p)
+}
+
 // decodePointer reconstructs a pointer cell: the wire body carries the
 // pointee's tokens and the cell is silent; a leading REF or nil selector
 // is the pointee's unless it names a value cell of the slot's own type.
@@ -2558,6 +2567,13 @@ func interiorOffsetZero(rv reflect.Value, t reflect.Type) (reflect.Value, bool) 
 // pointee decodes (two-phase; cycles close through the id); zero-size
 // targets mirror the encoder and reserve nothing.
 func (d *codecDecoder) decodePointerCell(desc *wire.Desc, target reflect.Value, p pathNode) error {
+	if elem := target.Type().Elem(); elem.Kind() == reflect.Interface && desc.Refs[0].Kind == wire.KindInterface {
+		if k, name, ok := d.r.PeekDesc(); ok && k == wire.KindPointer {
+			if T, fits := slotGrainContainer(elem, name, d.reg); fits {
+				return d.decodeContainerGrainCell(T, p, target)
+			}
+		}
+	}
 	pv := reflect.New(target.Type().Elem())
 	if target.Type().Elem().Size() != 0 {
 		d.r.RegisterValue(pv)
@@ -2567,4 +2583,50 @@ func (d *codecDecoder) decodePointerCell(desc *wire.Desc, target reflect.Value, 
 	}
 	target.Set(pv)
 	return nil
+}
+
+// decodeContainerGrainCell opens a slot record at the container grain:
+// the cell registers as *T before the content tag is read, the content
+// decodes into the leading field, and the served slot is its address.
+func (d *codecDecoder) decodeContainerGrainCell(T reflect.Type, p pathNode, target reflect.Value) error {
+	pv := reflect.New(T)
+	if T.Size() != 0 {
+		d.r.RegisterValue(pv)
+	}
+	restore, err := d.chargeValueBody(p)
+	defer restore()
+	if err != nil {
+		return err
+	}
+	cd, err := d.r.ReadDesc()
+	if err != nil {
+		return d.mapErr(err)
+	}
+	slot := pv.Elem().Field(0)
+	if err := d.resolveConcrete(cd, slot, p); err != nil {
+		return err
+	}
+	target.Set(slot.Addr())
+	return nil
+}
+
+// slotGrainContainer resolves the container grain of a slot-record
+// opening from the peeked content tag: the tag names *T in the type
+// registry for a struct T whose leading field carries the slot element.
+func slotGrainContainer(elem reflect.Type, name string, reg map[string]reflect.Type) (reflect.Type, bool) {
+	if reg == nil || name == "" {
+		return nil, false
+	}
+	rt, ok := reg[name]
+	if !ok || rt.Kind() != reflect.Pointer {
+		return nil, false
+	}
+	T := rt.Elem()
+	if T.Kind() != reflect.Struct || T.NumField() == 0 {
+		return nil, false
+	}
+	if f := T.Field(0); f.Name == "_" || f.Type != elem {
+		return nil, false
+	}
+	return T, true
 }

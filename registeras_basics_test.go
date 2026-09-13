@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -356,5 +357,32 @@ func TestRegisterAsCoderLeafValidation(t *testing.T) {
 	}
 	if !got.Built.Equal(want.Built) || got.Name != want.Name {
 		t.Fatalf("round-trip drift: %#v vs %#v", got, want)
+	}
+}
+
+// A map value in an any slot against a pointer-shaped binding fails
+// path-less: the mismatch has no value-path context at the interface
+// resolution boundary.
+func TestRegisterAsAnySlotMapMismatchPathless(t *testing.T) {
+	var buf bytes.Buffer
+	enc := gbon.NewEncoder(&buf)
+	if err := enc.Encode([]any{map[string]int{"a": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	dec := gbon.NewDecoder(&buf)
+	if err := dec.RegisterAs("map[string]int", new(any)); err != nil {
+		t.Fatal(err)
+	}
+	var got []any
+	err := dec.Decode(&got)
+	var ge *gbon.Error
+	if !errors.As(err, &ge) || ge.Class() != "type_mismatch" {
+		t.Fatalf("map in any slot: %v", err)
+	}
+	if ge.Path != "" {
+		t.Fatalf("map in any slot: path %q, want empty", ge.Path)
+	}
+	if !strings.Contains(err.Error(), "stream kind 3, target ptr") {
+		t.Fatalf("map in any slot: text %q", err.Error())
 	}
 }

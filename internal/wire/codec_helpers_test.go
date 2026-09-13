@@ -110,6 +110,100 @@ func TestInternRecordSortAt(t *testing.T) {
 	}
 }
 
+// TestPeekDescKind pins the header lookahead: kind forms, the literal
+// name, no consumption, idempotent repeat, and rejection outcomes.
+func TestPeekDescKind(t *testing.T) {
+	r := NewReader([]byte{0xD6, 0x60})
+	if k, name, ok := r.PeekDesc(); !ok || k != KindInterface || name != "" {
+		t.Fatalf("inline form: PeekDesc = %d, %q, %v, want interface, \"\"", k, name, ok)
+	}
+	if r.Pos() != 0 {
+		t.Fatalf("PeekDesc consumed: Pos = %d", r.Pos())
+	}
+	if k, _, ok := r.PeekDesc(); !ok || k != KindInterface {
+		t.Fatalf("repeat: PeekDesc = %d, %v, want interface", k, ok)
+	}
+	if _, err := r.ReadDesc(); err != nil {
+		t.Fatalf("consuming read after peek: %v", err)
+	}
+
+	// named pointer header + inline name: kind and name without consumption
+	r1 := NewReader([]byte{0xD5, 0x68, '*', 'm', 'a', 'i', 'n', '.', 'S', '1'})
+	if k, name, ok := r1.PeekDesc(); !ok || k != KindPointer || name != "*main.S1" {
+		t.Fatalf("named form: PeekDesc = %d, %q, %v, want pointer, *main.S1", k, name, ok)
+	}
+	if r1.Pos() != 0 {
+		t.Fatalf("named form consumed: Pos = %d", r1.Pos())
+	}
+
+	// ARG-extended form: kind 12 rides a u8 payload; u8-length name.
+	r2 := NewReader([]byte{0xDC, 0x0C, 0x6C, 0x03, 'a', 'b', 'c'})
+	if k, name, ok := r2.PeekDesc(); !ok || k != KindString || name != "abc" {
+		t.Fatalf("arg form: PeekDesc = %d, %q, %v, want string, abc", k, name, ok)
+	}
+	if r2.Pos() != 0 {
+		t.Fatalf("arg form consumed: Pos = %d", r2.Pos())
+	}
+
+	// negative: non-DESC classes
+	for _, b := range []byte{0xC2, 0x01, 0x62} {
+		if _, _, ok := NewReader([]byte{b}).PeekDesc(); ok {
+			t.Fatalf("class %#02x: PeekDesc must reject", b)
+		}
+	}
+	// negative: truncated header, truncated name token, truncated name body
+	for _, b := range [][]byte{{0xDC}, {0xD5}, {0xD5, 0x6C}, {0xD5, 0x6C, 0x04, 'a'}} {
+		if _, _, ok := NewReader(b).PeekDesc(); ok {
+			t.Fatalf("truncated % x: PeekDesc must reject", b)
+		}
+	}
+	// negative: header not followed by a STRING token
+	if _, _, ok := NewReader([]byte{0xD5, 0xC2}).PeekDesc(); ok {
+		t.Fatal("non-string name position: PeekDesc must reject")
+	}
+	// negative: non-minimal kind (inline-range kind via ARG) and
+	// reserved kind
+	for _, payload := range []byte{0x05, 0x10} {
+		if _, _, ok := NewReader([]byte{0xDC, payload}).PeekDesc(); ok {
+			t.Fatalf("arg payload %#02x: PeekDesc must reject", payload)
+		}
+	}
+	// negative: unknown inline form
+	if _, _, ok := NewReader([]byte{0xDD}).PeekDesc(); ok {
+		t.Fatal("form 13: PeekDesc must reject")
+	}
+}
+
+// TestPeekDescStreamWindow mirrors the peek contract over a live
+// source: the lookahead blocks for exactly the token extent, and the
+// consuming read matches the buffered-mode oracle.
+func TestPeekDescStreamWindow(t *testing.T) {
+	var raw []byte
+	raw = append(raw, Magic...)
+	raw = append(raw, Major, Minor)
+	raw = append(raw, 0xD5, 0x68, '*', 'm', 'a', 'i', 'n', '.', 'S', '1') // pointer header + inline name
+
+	sr := NewStreamReader(bytes.NewReader(raw))
+	if _, _, err := sr.ReadHeader(); err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	br := NewReader(raw)
+	if _, _, err := br.ReadHeader(); err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	wantK, wantName, ok := br.PeekDesc()
+	if !ok || wantK != KindPointer || wantName != "*main.S1" {
+		t.Fatalf("buffered PeekDesc = %d, %q, %v", wantK, wantName, ok)
+	}
+	gotK, gotName, ok := sr.PeekDesc()
+	if !ok || gotK != wantK || gotName != wantName {
+		t.Fatalf("stream PeekDesc = %d, %q, %v, want %d, %q", gotK, gotName, ok, wantK, wantName)
+	}
+	if sr.Pos() != br.Pos() {
+		t.Fatalf("stream Pos %d drifted from buffered %d", sr.Pos(), br.Pos())
+	}
+}
+
 func TestPeekClassIsNextNil(t *testing.T) {
 	r := NewReader([]byte{0x01})
 	if c, err := r.PeekClass(); err != nil || c != ClassNil {

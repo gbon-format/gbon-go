@@ -89,6 +89,7 @@ type vecDM struct {
 	B map[string]int64
 	S string
 }
+type vecS1 struct{ F1 any }
 
 var corpusBindings = []struct {
 	name string
@@ -109,6 +110,8 @@ var corpusBindings = []struct {
 	{"*vec.ring", (*vecRing)(nil)},
 	{"*vec.evo2", (*vecEvo2)(nil)},
 	{"map[*vec.node]int64", map[*vecNode]int64{}},
+	{"main.S1", vecS1{}},
+	{"*main.S1", (*vecS1)(nil)},
 }
 
 // corpusMapTypes resolves explicit map type names carried by map nodes.
@@ -244,8 +247,10 @@ func newCorpusDecoder(data []byte) *gbon.Decoder {
 // binding of the corpus graph model).
 
 type irBuilder struct {
-	nodes   map[string]map[string]any
-	storage map[string]reflect.Value
+	nodes    map[string]map[string]any
+	storage  map[string]reflect.Value
+	built    map[string]bool
+	building map[string]bool
 }
 
 func nodeKind(n map[string]any) string {
@@ -284,7 +289,7 @@ func irInt(n map[string]any, k string) int {
 func (b *irBuilder) build(x any) (reflect.Value, error) {
 	if m, ok := x.(map[string]any); ok {
 		if ref, ok := m["ref"].(string); ok {
-			if st, ok := b.storage[ref]; ok {
+			if st, ok := b.storage[ref]; ok && (b.built[ref] || b.building[ref]) {
 				return st, nil
 			}
 			n := b.nodes[ref]
@@ -318,9 +323,16 @@ func (b *irBuilder) build(x any) (reflect.Value, error) {
 }
 
 func (b *irBuilder) buildNode(label string, n map[string]any) (reflect.Value, error) {
-	if st, ok := b.storage[label]; ok {
-		return st, nil
+	if b.built[label] {
+		if st, ok := b.storage[label]; ok {
+			return st, nil
+		}
 	}
+	b.building[label] = true
+	defer func() {
+		b.building[label] = false
+		b.built[label] = true
+	}()
 	switch nodeKind(n) {
 	case "int":
 		s := irString(n, "value")
@@ -419,9 +431,19 @@ func (b *irBuilder) buildNode(label string, n map[string]any) (reflect.Value, er
 		return b.buildStruct(n)
 	case "iface":
 		// iface-slot storage: the slot cell registers before its payload
-		// builds, so self-referential payloads resolve through {ref}
+		// builds, so self-referential payloads resolve through {ref};
+		// a preregistered field slot is reused as the node's storage;
+		// a chain tag two or more pointers deep is a pointer variable,
+		// not an interface slot
 		st := reflect.New(reflect.TypeFor[any]()).Elem()
-		b.storage[label] = st
+		if chainDepth(irString(n, "type")) >= 2 {
+			st = reflect.New(reflect.TypeFor[*any]()).Elem()
+			b.storage[label] = st
+		} else if pre, ok := b.storage[label]; ok && pre.IsValid() && pre.CanSet() && pre.Kind() == reflect.Interface {
+			st = pre
+		} else {
+			b.storage[label] = st
+		}
 		inner, err := b.build(n["value"])
 		if err != nil {
 			return reflect.Value{}, err
@@ -429,12 +451,30 @@ func (b *irBuilder) buildNode(label string, n map[string]any) (reflect.Value, er
 		if !inner.IsValid() {
 			inner = reflect.Zero(reflect.TypeFor[any]())
 		}
+		// a {ref} payload under a bound pointer type is a REF in a
+		// pointer position: it takes the target storage's address (REF
+		// identity), not a copy of its value
+		if bt, ok := b.bindingType(irString(n, "type")); ok && bt.Kind() == reflect.Pointer {
+			if rv, ok := n["value"].(map[string]any); ok {
+				if ref, ok := rv["ref"].(string); ok {
+					if err := b.materialize(ref); err != nil {
+						return reflect.Value{}, err
+					}
+					if target, ok := b.storage[ref]; ok && target.CanAddr() && target.Type() == bt.Elem() {
+						inner = target.Addr()
+					}
+				}
+			}
+		}
 		// a {ref} payload under a derivable-chain declared type is a REF
 		// in a pointer position: it takes the target storage's address
 		// (REF identity), not a copy of its value
 		if _, isChain := deriveIfacePtrChainForTest(irString(n, "type")); isChain {
 			if rv, ok := n["value"].(map[string]any); ok {
 				if ref, ok := rv["ref"].(string); ok {
+					if err := b.materialize(ref); err != nil {
+						return reflect.Value{}, err
+					}
 					if target, ok := b.storage[ref]; ok && target.CanAddr() {
 						inner = target.Addr()
 					}
@@ -455,6 +495,36 @@ func (b *irBuilder) buildNode(label string, n map[string]any) (reflect.Value, er
 		return st, nil
 	}
 	return reflect.Value{}, fmt.Errorf("unbuildable kind %q", nodeKind(n))
+}
+
+// chainDepth counts the leading pointer stars of a declared type name.
+func chainDepth(t string) int {
+	d := 0
+	for d < len(t) && t[d] == '*' {
+		d++
+	}
+	return d
+}
+
+// materialize builds a referenced node unless it is built or in flight,
+// so address-taking {ref} edges never observe an unbuilt storage.
+func (b *irBuilder) materialize(ref string) error {
+	n := b.nodes[ref]
+	if n == nil || b.built[ref] || b.building[ref] {
+		return nil
+	}
+	_, err := b.buildNode(ref, n)
+	return err
+}
+
+// bindingType resolves a declared type name through the corpus bindings.
+func (b *irBuilder) bindingType(name string) (reflect.Type, bool) {
+	for _, bd := range corpusBindings {
+		if bd.name == name {
+			return reflect.TypeOf(bd.ex), true
+		}
+	}
+	return nil, false
 }
 
 // inferType picks a value's Go type from the IR node shape alone, without
@@ -709,7 +779,11 @@ func (b *irBuilder) buildStruct(n map[string]any) (reflect.Value, error) {
 	}
 	st := reflect.New(reflect.TypeOf(proto)).Elem()
 	if lbl, has := n["node"].(string); has {
-		b.storage[lbl] = st
+		if pre, ok := b.storage[lbl]; ok && pre.IsValid() {
+			st = pre
+		} else {
+			b.storage[lbl] = st
+		}
 	}
 	fields, _ := n["fields"].([]any)
 	for _, f := range fields {
@@ -784,7 +858,7 @@ func (b *irBuilder) buildRoot(ir map[string]any) (reflect.Value, error) {
 }
 
 func newBuilder(ir map[string]any) (*irBuilder, error) {
-	b := &irBuilder{nodes: map[string]map[string]any{}, storage: map[string]reflect.Value{}}
+	b := &irBuilder{nodes: map[string]map[string]any{}, storage: map[string]reflect.Value{}, built: map[string]bool{}, building: map[string]bool{}}
 	ns, _ := ir["nodes"].([]any)
 	for _, x := range ns {
 		n, _ := x.(map[string]any)
@@ -795,7 +869,50 @@ func newBuilder(ir map[string]any) (*irBuilder, error) {
 			b.nodes[lbl] = n
 		}
 	}
+	b.preslot()
 	return b, nil
+}
+
+// preslot preregisters struct storages and their interface-field slots:
+// an iface node named by a field value receives the field's storage,
+// binding the slot to its container the way the decoder does.
+func (b *irBuilder) preslot() {
+	for lbl, n := range b.nodes {
+		if nodeKind(n) != "struct" {
+			continue
+		}
+		var proto any
+		for _, bd := range corpusBindings {
+			if bd.name == irString(n, "type") {
+				proto = bd.ex
+			}
+		}
+		if proto == nil {
+			continue
+		}
+		st := reflect.New(reflect.TypeOf(proto)).Elem()
+		b.storage[lbl] = st
+		fields, _ := n["fields"].([]any)
+		for _, f := range fields {
+			fd, _ := f.(map[string]any)
+			if fd == nil {
+				continue
+			}
+			rv, ok := fd["value"].(map[string]any)
+			if !ok {
+				continue
+			}
+			ref, ok := rv["ref"].(string)
+			if !ok {
+				continue
+			}
+			if target := b.nodes[ref]; target != nil && nodeKind(target) == "iface" {
+				if fv := st.FieldByName(irString(fd, "name")); fv.IsValid() && fv.Kind() == reflect.Interface {
+					b.storage[ref] = fv
+				}
+			}
+		}
+	}
 }
 
 // cmpValues: identity-aware lockstep comparison. Pointers and maps pair by
@@ -971,6 +1088,16 @@ func corpusHasWideFloat(ir map[string]any) bool {
 	return found
 }
 
+// slotRootedCorpusWraps marks the slot-root vectors whose decoded any
+// target carries the root pointer: the built root compares boxed in
+// wrap pointer covers, not dereferenced.
+var slotRootedCorpusWraps = map[string]int{
+	"V-100": 0, "V-102": 0, "V-104": 0, "V-105": 0,
+}
+
+// chainRootedCorpusVector marks the double-pointer chain root.
+func chainRootedCorpusVector(id string) bool { return id == "V-101" }
+
 func runOKVector(t *testing.T, v *corpusVector, data []byte) {
 	// projection degrade: decimal128 is valid on the wire, unsupported here
 	if corpusHasWideFloat(v.rawIR) {
@@ -996,13 +1123,31 @@ func runOKVector(t *testing.T, v *corpusVector, data []byte) {
 	dv.SetLimits(corpusLimits(v))
 	comp := want
 	slotType := want.Type()
-	if slotType.Kind() == reflect.Pointer && !want.IsNil() {
+	if chainRootedCorpusVector(v.ID) {
+		// a double-pointer chain root decodes into its own grain: the
+		// deref comparison of value roots does not apply
+		comp = want
+	} else if slotType.Kind() == reflect.Pointer && !want.IsNil() {
 		slotType = slotType.Elem()
 		comp = want.Elem()
 	}
 	target := reflect.New(slotType)
 	if err := dv.Decode(target.Interface()); err != nil {
 		t.Fatalf("decode: %v", err)
+	}
+	if wraps, ok := slotRootedCorpusWraps[v.ID]; ok {
+		// slot-root roots: the decoded any target carries the root
+		// pointer itself, so the built root compares boxed in wrap
+		// pointer covers, not dereferenced
+		covered := want
+		for range wraps {
+			p := reflect.New(reflect.TypeFor[*any]()).Elem()
+			p.Set(covered)
+			covered = p.Addr()
+		}
+		box := reflect.New(reflect.TypeFor[any]()).Elem()
+		box.Set(covered)
+		comp = box
 	}
 	if !cmpValues(t, target.Elem(), comp, "$", map[uintptr]uintptr{}) {
 		t.Fatalf("decode != IR")
