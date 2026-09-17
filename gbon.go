@@ -14,6 +14,20 @@ import (
 // use by multiple goroutines.
 func Marshal(v any) ([]byte, error) { return codecMarshal(v) }
 
+// MarshalStable encodes v in stable mode. When any map in v's graph would
+// apply the pointer tie-break (pairs tied in key skeleton and value bytes,
+// ordered by pointer identity) or hold a zero float key of either sign —
+// the two declared sources of cross-process byte divergence — the call
+// fails with an ErrUnsupported error of class unstable_tie_break or
+// unstable_zero_float_key naming the path of the offending map pair.
+// Guard completeness is conditional on the wire specification's
+// exhaustiveness declaration: that exactly these two rules exhaust the
+// sources of process-dependence (wire specification section 8.1,
+// hypothesis H-1).
+// Inside the stable class the output is byte-identical to Marshal's. It is
+// safe for concurrent use by multiple goroutines.
+func MarshalStable(v any) ([]byte, error) { return codecMarshalStable(v) }
+
 // Unmarshal decodes wire bytes produced by Marshal into the value pointed to
 // by v. On any error the value pointed to by v is left exactly as it was
 // before the call (decode atomicity). It always decodes with the default
@@ -269,6 +283,13 @@ func (e *Encoder) SetLimits(l Limits) error {
 	e.enc.setLimits(l)
 	return nil
 }
+
+// SetStable switches this Encoder's stream to stable mode: Encode rejects
+// values outside the stable class (see MarshalStable) with a classified
+// error naming the offending path, and the flag rides the canonical-order
+// sub-marshals of map-pair values. The default is off; either way the
+// bytes of in-class values are identical.
+func (e *Encoder) SetStable(stable bool) { e.enc.stable = stable }
 
 // RegisterCoder installs c as the custom codec for values of example's type
 // in this Encoder's scope. Precedence over the

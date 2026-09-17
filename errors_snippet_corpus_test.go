@@ -1,12 +1,12 @@
 package gbon_test
 
 // The crafted corpus behind the identity baseline and the structured-log
-// probes: one public-API probe per error class, all twenty-two classes
+// probes: one public-API probe per error class, all twenty-four classes
 // covered. The eighteen probes of the oracle corpus are reused as-is; the
-// remaining four classes get dedicated probes here (duplicate key
+// remaining six classes get dedicated probes here (duplicate key
 // stream, a failing custom coder, a crafted allocation bomb under
-// raised limits, and a panicking custom coder attributed by the decode
-// tripwire).
+// raised limits, a panicking custom coder attributed by the decode
+// tripwire, and the two stable-mode guard rejects).
 
 import (
 	"bytes"
@@ -32,6 +32,13 @@ var snippetClasses = []string{
 	"unsupported_kind", "register_conflict", "coder_error", "coder_recursion",
 	"contract_mismatch", "io_read", "io_write",
 	"internal_panic",
+	"unstable_tie_break", "unstable_zero_float_key",
+}
+
+// snippetTieMap builds the guard's tie reject: two distinct pointers to
+// congruent pointees under equal pair values.
+func snippetTieMap() map[*int]int {
+	return map[*int]int{new(int): 1, new(int): 1}
 }
 
 type snippetCase struct {
@@ -91,6 +98,13 @@ func snippetCoderStream(t *testing.T, box any, coder gbon.Coder) []byte {
 	return buf.Bytes()
 }
 
+// stableErr adapts MarshalStable's two-value form to the corpus's err
+// field.
+func stableErr(v any) error {
+	_, err := gbon.MarshalStable(v)
+	return err
+}
+
 // snippetCorpus builds the twenty-one-class probe set. Every probe goes
 // through the public API on a crafted input; the returned cases carry
 // distinct classes, asserted against the inventory above.
@@ -126,6 +140,11 @@ func snippetCorpus(t *testing.T) []snippetCase {
 	}
 	out = append(out, snippetCase{name: "internal_panic", class: "internal_panic",
 		err: pdec.Decode(&pb)})
+
+	out = append(out, snippetCase{name: "unstable_tie_break", class: "unstable_tie_break",
+		err: stableErr(snippetTieMap())})
+	out = append(out, snippetCase{name: "unstable_zero_float_key", class: "unstable_zero_float_key",
+		err: stableErr(map[float64]int{0: 1})})
 
 	seen := map[string]string{}
 	for _, tc := range out {

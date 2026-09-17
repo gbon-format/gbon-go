@@ -155,6 +155,8 @@
 //	io_read           env: underlying reader failed
 //	io_write          env: underlying writer failed
 //	internal_panic    internal: foreign panic recovered by the tripwire
+//	unstable_tie_break       contract: stable mode rejected map pairs tied in skeleton and value bytes
+//	unstable_zero_float_key  contract: stable mode rejected a zero float map key
 //
 // classids-end
 package gbon

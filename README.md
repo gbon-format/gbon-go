@@ -283,7 +283,15 @@ prefixes; a SLICE-of-uint8 where a BLOB is canonical) are rejected on
 decode. One specification caveat: pointer-carrying map keys order by
 allocation sequence, so byte equality for isomorphic
 but address-distinct graphs is not specified across processes; within
-one encoding run it is deterministic.
+one encoding run it is deterministic. Stable mode names that boundary:
+`MarshalStable` and `Encoder.SetStable` reject the two rule violations
+declared to make bytes process-dependent — map pairs tied in key
+skeleton and value bytes (ordered by pointer identity) and zero float
+map keys — with the `unstable_tie_break` / `unstable_zero_float_key`
+classes naming the offending path; everything else encodes identically
+to the default mode. Guard completeness is conditional on the wire
+specification's exhaustiveness declaration — that exactly these two
+rules exhaust the sources of process-dependence (section 8.1).
 
 `encoding/gob`'s own documentation states it is "not designed to be
 hardened against adversarial inputs"; `vmihailenco/msgpack` is

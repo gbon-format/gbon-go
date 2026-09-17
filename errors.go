@@ -43,28 +43,30 @@ var (
 // public contract: additive only; IDs are never renamed or reused. Six
 // attribution families: data/format, budget, code, contract, env, internal.
 const (
-	classBadMagic         = "bad_magic"
-	classTruncated        = "truncated"
-	classMalformedOp      = "malformed_op"
-	classMalformedArg     = "malformed_arg"
-	classOverflowValue    = "overflow_value"
-	classDuplicateKey     = "duplicate_key"
-	classBadRef           = "bad_ref"
-	classBadView          = "bad_view"
-	classTypeMismatch     = "type_mismatch"
-	classUnknownName      = "unknown_name"
-	classBudgetDepth      = "budget_depth"
-	classBudgetNodes      = "budget_nodes"
-	classBudgetBytes      = "budget_bytes"
-	classBudgetAlloc      = "budget_alloc"
-	classUnsupportedKind  = "unsupported_kind"
-	classRegisterConflict = "register_conflict"
-	classCoderError       = "coder_error"
-	classCoderRecursion   = "coder_recursion"
-	classContractMismatch = "contract_mismatch"
-	classIORead           = "io_read"
-	classIOWrite          = "io_write"
-	classInternalPanic    = "internal_panic"
+	classBadMagic             = "bad_magic"
+	classTruncated            = "truncated"
+	classMalformedOp          = "malformed_op"
+	classMalformedArg         = "malformed_arg"
+	classOverflowValue        = "overflow_value"
+	classDuplicateKey         = "duplicate_key"
+	classBadRef               = "bad_ref"
+	classBadView              = "bad_view"
+	classTypeMismatch         = "type_mismatch"
+	classUnknownName          = "unknown_name"
+	classBudgetDepth          = "budget_depth"
+	classBudgetNodes          = "budget_nodes"
+	classBudgetBytes          = "budget_bytes"
+	classBudgetAlloc          = "budget_alloc"
+	classUnsupportedKind      = "unsupported_kind"
+	classRegisterConflict     = "register_conflict"
+	classCoderError           = "coder_error"
+	classCoderRecursion       = "coder_recursion"
+	classContractMismatch     = "contract_mismatch"
+	classIORead               = "io_read"
+	classIOWrite              = "io_write"
+	classInternalPanic        = "internal_panic"
+	classUnstableTieBreak     = "unstable_tie_break"
+	classUnstableZeroFloatKey = "unstable_zero_float_key"
 )
 
 // classSentinels is the deterministic class-to-sentinel table: data/format
@@ -73,28 +75,30 @@ const (
 // (internal_panic) to ErrInternal. Error.Is answers through this table
 // alone.
 var classSentinels = map[string]error{
-	classBadMagic:         ErrFormat,
-	classTruncated:        ErrFormat,
-	classMalformedOp:      ErrFormat,
-	classMalformedArg:     ErrFormat,
-	classOverflowValue:    ErrFormat,
-	classDuplicateKey:     ErrFormat,
-	classBadRef:           ErrFormat,
-	classBadView:          ErrFormat,
-	classTypeMismatch:     ErrFormat,
-	classUnknownName:      ErrFormat,
-	classBudgetDepth:      ErrBudget,
-	classBudgetNodes:      ErrBudget,
-	classBudgetBytes:      ErrBudget,
-	classBudgetAlloc:      ErrBudget,
-	classUnsupportedKind:  ErrUnsupported,
-	classRegisterConflict: ErrUnsupported,
-	classCoderError:       ErrUnsupported,
-	classCoderRecursion:   ErrUnsupported,
-	classContractMismatch: ErrUnsupported,
-	classIORead:           ErrIO,
-	classIOWrite:          ErrIO,
-	classInternalPanic:    ErrInternal,
+	classBadMagic:             ErrFormat,
+	classTruncated:            ErrFormat,
+	classMalformedOp:          ErrFormat,
+	classMalformedArg:         ErrFormat,
+	classOverflowValue:        ErrFormat,
+	classDuplicateKey:         ErrFormat,
+	classBadRef:               ErrFormat,
+	classBadView:              ErrFormat,
+	classTypeMismatch:         ErrFormat,
+	classUnknownName:          ErrFormat,
+	classBudgetDepth:          ErrBudget,
+	classBudgetNodes:          ErrBudget,
+	classBudgetBytes:          ErrBudget,
+	classBudgetAlloc:          ErrBudget,
+	classUnsupportedKind:      ErrUnsupported,
+	classRegisterConflict:     ErrUnsupported,
+	classCoderError:           ErrUnsupported,
+	classCoderRecursion:       ErrUnsupported,
+	classContractMismatch:     ErrUnsupported,
+	classIORead:               ErrIO,
+	classIOWrite:              ErrIO,
+	classInternalPanic:        ErrInternal,
+	classUnstableTieBreak:     ErrUnsupported,
+	classUnstableZeroFloatKey: ErrUnsupported,
 }
 
 // Error is the structured error type returned by the codec: class (the

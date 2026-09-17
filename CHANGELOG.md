@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Stable mode (encoder guard): `MarshalStable` and `Encoder.SetStable`
+  reject values outside the stable class — map pairs tied in key skeleton
+  and value bytes (pointer tie-break order) and zero float map keys of
+  either sign — with the additive error classes `unstable_tie_break` and
+  `unstable_zero_float_key` (contract family, `ErrUnsupported`), naming
+  the path of the offending map pair. Inside the class the bytes are
+  identical to the default mode; with the mode off the encoder is
+  byte-identical to the previous release.
+- Isomorphic-pair differential tests: independently allocated congruent
+  graphs encode byte-identically under map-iteration seeds, including
+  map-carried aliased backing arrays (overlapping windows and
+  array-pointer views over one backing).
+
 ## [0.1.0] - 2026-09-16
 
 The canonical-grain revision (minor 1, draft era): the record's grain is

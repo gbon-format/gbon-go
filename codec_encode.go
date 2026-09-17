@@ -242,6 +242,7 @@ type codecEncoder struct {
 	activeCodrs map[reflect.Type]bool
 	fac         *Encoder
 	inCoder     int                        // >0 inside a coder body: Encode skips the flush
+	stable      bool                       // stable mode armed: reject values outside the stable class
 	lim         Limits                     // effective encode budgets (depth/nodes/bytes)
 	depth       int                        // current encode recursion frames (scan and encodeBody passes)
 	nodes       int                        // output node count (encodeBody calls) this stream
@@ -292,6 +293,47 @@ func refFreeWalk(t reflect.Type, seen map[reflect.Type]bool) bool {
 		}
 		seen2[t] = true
 		return refFreeWalk(t.Elem(), seen2)
+	}
+	return true
+}
+
+// stableKeyWalk reports whether a map key type is free of components that
+// can apply the E4/E5 rules: pointer, interface, float, complex, and
+// unsafe-pointer kinds anywhere in the key graph (recursively through
+// struct fields and array elements) make every key of the type dynamic —
+// the stable guard must then run per map. Uncomparable kinds (slice, map,
+// chan, func) report false as well: they reject before any ordering, and
+// the conservative direction of the static verdict is fixed.
+func stableKeyWalk(t reflect.Type, seen map[reflect.Type]bool) bool {
+	if seen[t] {
+		return true
+	}
+	if len(seen) > 64 {
+		return false
+	}
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface,
+		reflect.Chan, reflect.Func, reflect.UnsafePointer,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		return false
+	case reflect.Struct:
+		seen2 := make(map[reflect.Type]bool, len(seen)+1)
+		for k := range seen {
+			seen2[k] = true
+		}
+		seen2[t] = true
+		for i := 0; i < t.NumField(); i++ {
+			if !stableKeyWalk(t.Field(i).Type, seen2) {
+				return false
+			}
+		}
+	case reflect.Array:
+		seen2 := make(map[reflect.Type]bool, len(seen)+1)
+		for k := range seen {
+			seen2[k] = true
+		}
+		seen2[t] = true
+		return stableKeyWalk(t.Elem(), seen2)
 	}
 	return true
 }
@@ -350,6 +392,8 @@ type typePlan struct {
 	elemZero   bool       // opPointer: element type has Go size zero
 	keyFree    bool       // opMap: refFreeWalk of the key type
 	valFree    bool       // opMap: refFreeWalk of the value type
+	keySafe    bool       // opMap: key type free of pointer/interface/float/complex components
+	stable     bool       // static stable-class verdict: no subtree map can apply E4/E5 (conservative)
 	keyPlan    *typePlan  // opMap scan children
 	valPlan    *typePlan
 	fields     []planField     // opStruct emission fields
@@ -526,6 +570,7 @@ func (b *planBuilder) build(t reflect.Type) *typePlan {
 		pl.op = opMap
 		pl.keyFree = refFreeWalk(t.Key(), nil)
 		pl.valFree = refFreeWalk(t.Elem(), nil)
+		pl.keySafe = stableKeyWalk(t.Key(), nil)
 		pl.keyPlan = b.build(t.Key())
 		pl.valPlan = b.build(t.Elem())
 	case reflect.Struct:
@@ -584,11 +629,21 @@ func (b *planBuilder) childrenCacheable(pl *typePlan) bool {
 
 // classify computes the C8 machinery class (union of sharing sources
 // over the plan subtree) and, for pure nodes, the static scan depth.
+// The static stable-class verdict rides the same bottom-up fold:
+// interfaces anywhere and map keys carrying pointer/interface/float/
+// complex components force the dynamic guard path (the conservative
+// direction never classifies an unstable-capable subtree as stable).
 func (b *planBuilder) classify(pl *typePlan) {
 	pure, depth := true, 1
+	stable := true
 	child := func(c *typePlan) {
 		if c != nil && !c.pure {
 			pure = false
+		}
+	}
+	stableChild := func(c *typePlan) {
+		if c != nil && !c.stable {
+			stable = false
 		}
 	}
 	switch pl.op {
@@ -599,6 +654,7 @@ func (b *planBuilder) classify(pl *typePlan) {
 		pure = false // slice: grouping source
 	case opSlice, opArray:
 		child(pl.elem)
+		stableChild(pl.elem)
 		if pl.elemScan && pl.elem != nil {
 			depth = 1 + pl.elem.scanDepth
 		}
@@ -607,24 +663,31 @@ func (b *planBuilder) classify(pl *typePlan) {
 		}
 	case opMap:
 		pure = false // identity source
+		stable = pl.keySafe
+		stableChild(pl.valPlan)
 	case opStruct:
 		for i := range pl.scanFields {
 			c := pl.scanFields[i].plan
 			child(c)
+			stableChild(c)
 			if c != nil && c.scanDepth >= depth {
 				depth = 1 + c.scanDepth
 			}
 		}
 	case opPointer:
 		pure = false // identity source
+		stableChild(pl.elem)
 	case opInterface:
 		pure = false // identity source; dynamic dispatch stays generic (A-2)
+		stable = false
 	case opCoder:
+		// coder leaves are guard leaves: the image is the coder's contract
 	}
 	if !pure {
 		depth = 1
 	}
 	pl.pure, pl.scanDepth = pure, depth
+	pl.stable = stable
 }
 
 // rankWalker returns the stream's rank-cell walker, built on first use
@@ -1194,6 +1257,28 @@ func codecMarshal(v any) ([]byte, error) {
 	return codecMarshalScoped(v, nil)
 }
 
+// codecMarshalStable encodes one self-contained stream with the stable
+// guard armed (MarshalStable): values outside the stable class fail with
+// a classified error; in-class bytes are identical to codecMarshal's.
+func codecMarshalStable(v any) ([]byte, error) {
+	e := encoderPool.Get().(*codecEncoder)
+	e.resetForPool(nil)
+	e.stable = true
+	defer encoderPool.Put(e)
+	if err := e.w.WriteHeader(); err != nil {
+		return nil, err
+	}
+	e.streamStart = len(e.w.Bytes())
+	e.growForRoot(v)
+	if err := e.encodeRoot(v); err != nil {
+		return nil, err
+	}
+	b := e.w.Bytes()
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out, nil
+}
+
 // encoderPool recycles stateless-Marshal encoders (intern tables,
 // scratch, output buffer) across calls; the streaming Encoder facade is
 // stream-lifetime state and never enters the pool.
@@ -1226,17 +1311,19 @@ func codecMarshalScoped(v any, src *codecEncoder) ([]byte, error) {
 
 // resetForPool returns the encoder to fresh-stream state: intern tables
 // cleared (buckets retained), counters zeroed, buffer kept up to the
-// Writer cap bound, coder scope and budgets inherited from src when
-// present.
+// Writer cap bound, coder scope, budgets, and the stable flag inherited
+// from src when present.
 func (e *codecEncoder) resetForPool(src *codecEncoder) {
 	if src != nil {
 		e.coders = src.coders
 		e.lim = src.lim
 		e.scopeEpoch = src.scopeEpoch
+		e.stable = src.stable
 	} else {
 		e.coders = nil
 		e.lim = effEncodeLimits(Limits{})
 		e.scopeEpoch = 0
+		e.stable = false
 	}
 	clear(e.types)
 	clear(e.maps)
@@ -2642,6 +2729,7 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode, kp *typePlan) erro
 		lazy    bool
 		ptrseq  []uintptr
 		lazySeq bool
+		zero    bool
 		err     error
 	}
 	valBytes := func(pr *pair) []byte {
@@ -2671,7 +2759,7 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode, kp *typePlan) erro
 		}
 		off := len(rw.arena)
 		rw.arena = append(rw.arena, rw.cells...)
-		pairs = append(pairs, pair{rank: rw.arena[off:], k: k, val: iter.Value()})
+		pairs = append(pairs, pair{rank: rw.arena[off:], k: k, val: iter.Value(), zero: rw.zeroKey})
 		i++
 	}
 	keySeq := func(p *pair) []uintptr {
@@ -2701,6 +2789,48 @@ func (e *codecEncoder) encodeMap(v reflect.Value, p pathNode, kp *typePlan) erro
 	for j := range pairs {
 		if pairs[j].err != nil {
 			return pairs[j].err
+		}
+	}
+	// Stable guard (dynamic predicate): maps whose plan is not statically
+	// stable get the in-path scan over the sorted index — E5 adjacency
+	// (rank-equal neighbors with byte-equal values, the pair order then
+	// decided by the pointer sequence) and E4 zero-float keys, reported in
+	// sorted-index order so class and path are functions of the value
+	// alone. A guard sub-marshal failure propagates as the pair error
+	// above does (a nested violation carries its own rule class).
+	if e.stable && !e.planFor(v.Type()).stable {
+		tieAt, zeroAt := -1, -1
+		for j := 0; j+1 < len(idx); j++ {
+			if rankLess(pairs[idx[j]].rank, pairs[idx[j+1]].rank) != 0 {
+				continue
+			}
+			va, vb := valBytes(&pairs[idx[j]]), valBytes(&pairs[idx[j+1]])
+			if pairs[idx[j]].err != nil {
+				return pairs[idx[j]].err
+			}
+			if pairs[idx[j+1]].err != nil {
+				return pairs[idx[j+1]].err
+			}
+			if bytes.Equal(va, vb) {
+				tieAt = j
+				break
+			}
+		}
+		for j := range idx {
+			if pairs[idx[j]].zero {
+				zeroAt = j
+				break
+			}
+		}
+		if zeroAt >= 0 && (tieAt < 0 || zeroAt <= tieAt) {
+			pn := pathNode{parent: &p, idx: zeroAt}
+			return errUnsupported(classUnstableZeroFloatKey, pn.String(), nil, nil,
+				errDetail("map holds a zero float key of ambiguous stored sign"))
+		}
+		if tieAt >= 0 {
+			pn := pathNode{parent: &p, idx: tieAt}
+			return errUnsupported(classUnstableTieBreak, pn.String(), nil, nil,
+				errDetail("map pairs tied in key skeleton and value bytes order by pointer identity"))
 		}
 	}
 	// Intern record: register the id the header will take, so value
@@ -2986,6 +3116,7 @@ type rankWalker struct {
 	cells      []uint64
 	arena      []uint64
 	track      bool
+	zeroKey    bool
 	strs       map[string]uint64
 	descClaims map[string]rankDescClaim
 	nextID     uint64
@@ -3019,6 +3150,7 @@ func newRankWalker(track bool) *rankWalker {
 // per-key reset of the render scratch it replaces.
 func (rw *rankWalker) resetKey() {
 	rw.cells = rw.cells[:0]
+	rw.zeroKey = false
 	clear(rw.seen)
 	if rw.track {
 		clear(rw.strs)
@@ -3046,12 +3178,20 @@ func (rw *rankWalker) walk(v reflect.Value, p pathNode) error {
 		if math.IsNaN(v.Float()) {
 			return unsupportedAt("NaN map key component", p.String())
 		}
-		rw.cells = append(rw.cells, 0x40, uint64(math.Float32bits(float32(v.Float()))))
+		b32 := math.Float32bits(float32(v.Float()))
+		if b32 == 0 || b32 == 0x80000000 {
+			rw.zeroKey = true
+		}
+		rw.cells = append(rw.cells, 0x40, uint64(b32))
 	case reflect.Float64:
 		if math.IsNaN(v.Float()) {
 			return unsupportedAt("NaN map key component", p.String())
 		}
-		rw.cells = append(rw.cells, 0x41, math.Float64bits(v.Float()))
+		b64 := math.Float64bits(v.Float())
+		if b64 == 0 || b64 == 0x8000000000000000 {
+			rw.zeroKey = true
+		}
+		rw.cells = append(rw.cells, 0x41, b64)
 	case reflect.Complex64, reflect.Complex128:
 		c := v.Complex()
 		if math.IsNaN(real(c)) || math.IsNaN(imag(c)) {
@@ -3059,11 +3199,19 @@ func (rw *rankWalker) walk(v reflect.Value, p pathNode) error {
 		}
 		if v.Kind() == reflect.Complex64 {
 			c64 := complex64(c)
+			rb, ib := math.Float32bits(real(c64)), math.Float32bits(imag(c64))
+			if (rb == 0 || rb == 0x80000000) || (ib == 0 || ib == 0x80000000) {
+				rw.zeroKey = true
+			}
 			rw.cells = append(rw.cells, 0x50,
-				uint64(math.Float32bits(real(c64)))<<32|uint64(math.Float32bits(imag(c64))))
+				uint64(rb)<<32|uint64(ib))
 			break
 		}
-		rw.cells = append(rw.cells, 0x51, math.Float64bits(real(c)), math.Float64bits(imag(c)))
+		rb, ib := math.Float64bits(real(c)), math.Float64bits(imag(c))
+		if (rb == 0 || rb == 0x8000000000000000) || (ib == 0 || ib == 0x8000000000000000) {
+			rw.zeroKey = true
+		}
+		rw.cells = append(rw.cells, 0x51, rb, ib)
 	case reflect.String:
 		s := v.String()
 		if rw.track {

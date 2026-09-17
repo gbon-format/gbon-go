@@ -672,4 +672,10 @@ var snippetIdentityBaseline = map[string][2]string{
 	"unsupported_kind": {"gbon: unsupported_kind at $.F: unsupported kind func (func())",
 		"gbon: unsupported_kind at $.F: unsupported kind func (func())\n    class = unsupported_kind\n    path = $.F\n    cause = unsupported kind func (func" +
 			"())"},
+	"unstable_tie_break": {"gbon: unstable_tie_break at $[0]: map pairs tied in key skeleton and value bytes order by pointer identity",
+		"gbon: unstable_tie_break at $[0]: map pairs tied in key skeleton and value bytes order by pointer identity\n    class = unstable_tie_break\n    path = $[0]\n    cause = map pai" +
+			"rs tied in key skeleton and value bytes order by pointer identity"},
+	"unstable_zero_float_key": {"gbon: unstable_zero_float_key at $[0]: map holds a zero float key of ambiguous stored sign",
+		"gbon: unstable_zero_float_key at $[0]: map holds a zero float key of ambiguous stored sign\n    class = unstable_zero_float_key\n    path = $[0]\n    cause = map holds a zero fl" +
+			"oat key of ambiguous stored sign"},
 }

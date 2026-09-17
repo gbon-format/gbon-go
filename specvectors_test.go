@@ -43,7 +43,16 @@ type corpusFile struct {
 	Vectors  []*corpusVector `json:"vectors"`
 }
 
+type corpusLedgerRow struct {
+	Test       string `json:"test"`
+	Level      string `json:"level"`
+	Claim      string `json:"claim"`
+	Sub        string `json:"sub"`
+	Instrument string `json:"instrument"`
+}
+
 type corpusManifest struct {
+	Version    int `json:"version"`
 	Categories []struct {
 		File    string   `json:"file"`
 		Section string   `json:"section"`
@@ -54,6 +63,7 @@ type corpusManifest struct {
 		Category string `json:"category"`
 		Verdict  string `json:"verdict"`
 	} `json:"vectors"`
+	Ledger []corpusLedgerRow `json:"ledger"`
 }
 
 // Local types bound to corpus wire names through RegisterAs.
@@ -118,6 +128,12 @@ type vecGrainF struct {
 	Q *bool
 	P *int64
 }
+type vecAliased struct{ A, B, C []int64 }
+type vecAppended struct{ P, Q []int64 }
+type vecGrainWin struct {
+	W []int64
+	P *[3]int64
+}
 
 var corpusBindings = []struct {
 	name string
@@ -157,15 +173,24 @@ var corpusBindings = []struct {
 	{"*main.N", (*vecGrainN)(nil)},
 	{"main.F", vecGrainF{}},
 	{"*main.F", (*vecGrainF)(nil)},
+	{"vec.aliased", vecAliased{}},
+	{"vec.appended", vecAppended{}},
+	{"vec.grain", vecGrainWin{}},
+	{"map[string]vec.aliased", map[string]vecAliased{}},
+	{"map[string]vec.appended", map[string]vecAppended{}},
+	{"map[string]vec.grain", map[string]vecGrainWin{}},
 	{"struct {}", struct{}{}},
 	{"*struct {}", (*struct{})(nil)},
 }
 
 // corpusMapTypes resolves explicit map type names carried by map nodes.
 var corpusMapTypes = map[string]reflect.Type{
-	"map[*int64]string":   reflect.TypeFor[map[*int64]string](),
-	"map[*vec.node]int64": reflect.TypeFor[map[*vecNode]int64](),
-	"map[string]int64":    reflect.TypeFor[map[string]int64](),
+	"map[*int64]string":       reflect.TypeFor[map[*int64]string](),
+	"map[*vec.node]int64":     reflect.TypeFor[map[*vecNode]int64](),
+	"map[string]int64":        reflect.TypeFor[map[string]int64](),
+	"map[string]vec.aliased":  reflect.TypeFor[map[string]vecAliased](),
+	"map[string]vec.appended": reflect.TypeFor[map[string]vecAppended](),
+	"map[string]vec.grain":    reflect.TypeFor[map[string]vecGrainWin](),
 }
 
 // ifaceTypeNames resolves interface payload type tags that appear in the corpus.
@@ -205,6 +230,15 @@ func loadCorpus(t *testing.T) []*corpusVector {
 	if err := json.Unmarshal(mb, &man); err != nil {
 		t.Fatalf("manifest parse: %v", err)
 	}
+	// schema coupling: a version outside the accepted set is a red, not
+	// a skip; a version-2 manifest without its ledger block would
+	// silently no-op every ledger-driven behavior
+	if man.Version != 1 && man.Version != 2 {
+		t.Fatalf("corpus schema version %d outside the accepted set {1,2}", man.Version)
+	}
+	if man.Version == 2 && len(man.Ledger) == 0 {
+		t.Fatalf("corpus schema version 2 carries no ledger block")
+	}
 	var out []*corpusVector
 	for _, cat := range man.Categories {
 		pb, err := os.ReadFile(filepath.Join(root, cat.File))
@@ -235,6 +269,151 @@ func loadCorpus(t *testing.T) []*corpusVector {
 		t.Fatal("empty corpus")
 	}
 	return out
+}
+
+// censusClassShape mirrors the declaration block a fixture-class file
+// may carry: its presence marks the census class.
+type censusClassShape struct {
+	Declaration *struct {
+		Grammar    string `json:"grammar"`
+		CensusSize int    `json:"census_size"`
+		Families   []struct {
+			Name string `json:"name"`
+		} `json:"families"`
+	} `json:"declaration"`
+}
+
+// ledgerFixtureClass derives the class of a cited fixture from its
+// category file: a declaration block marks the census class, its
+// absence the fixed-vector class.
+func ledgerFixtureClass(t *testing.T, root, category string) string {
+	t.Helper()
+	pb, err := os.ReadFile(filepath.Join(root, "vectors", category+".json"))
+	if err != nil {
+		t.Fatalf("fixture class %s: %v", category, err)
+	}
+	var shape censusClassShape
+	if err := json.Unmarshal(pb, &shape); err != nil {
+		t.Fatalf("fixture class %s parse: %v", category, err)
+	}
+	if shape.Declaration != nil {
+		return "census"
+	}
+	return "vector"
+}
+
+// materializeLedgerCensus validates the census class vocabulary the
+// loader consumes: the grammar bound and the family names. The pair
+// construction and byte-compare legs ride the differential runner.
+func materializeLedgerCensus(t *testing.T, root, category string) {
+	t.Helper()
+	pb, err := os.ReadFile(filepath.Join(root, "vectors", category+".json"))
+	if err != nil {
+		t.Fatalf("census class %s: %v", category, err)
+	}
+	var shape censusClassShape
+	if err := json.Unmarshal(pb, &shape); err != nil {
+		t.Fatalf("census class %s parse: %v", category, err)
+	}
+	if shape.Declaration == nil {
+		t.Fatalf("census class %s carries no declaration", category)
+	}
+	if shape.Declaration.Grammar != "canongrain.Graphs" {
+		t.Fatalf("census class %s: unknown grammar %q", category, shape.Declaration.Grammar)
+	}
+	if shape.Declaration.CensusSize <= 0 {
+		t.Fatalf("census class %s: census size %d", category, shape.Declaration.CensusSize)
+	}
+	known := map[string]bool{"census-pair": true, "aliased-backing": true, "multi-grain-address": true}
+	for _, f := range shape.Declaration.Families {
+		if !known[f.Name] {
+			t.Fatalf("census class %s: unknown fixture family %q", category, f.Name)
+		}
+	}
+}
+
+// materializeLedgerVector runs one fixed-byte fixture through the
+// adapter operations: materialize from the IR, encode to bytes,
+// decode to observables.
+func materializeLedgerVector(t *testing.T, v *corpusVector) {
+	t.Helper()
+	data, err := hex.DecodeString(v.Bytes)
+	if err != nil {
+		t.Fatalf("hex: %v", err)
+	}
+	switch v.Verdict {
+	case "ok":
+		runOKVector(t, v, data)
+	case "format":
+		runNegativeVector(t, v, data, gbon.ErrFormat)
+	case "budget":
+		runNegativeVector(t, v, data, gbon.ErrBudget)
+	default:
+		t.Fatalf("unknown verdict %q", v.Verdict)
+	}
+}
+
+// TestSpecLedger: the frozen schema consumed — every F row resolves to
+// a live fixture and materializes through its fixture class; level I
+// rows resolve in the gbon-go tree through the spec gate's lint leg.
+func TestSpecLedger(t *testing.T) {
+	root := corpusRoot(t)
+	if root == "" {
+		t.Skip("conformance corpus not mounted (set GBON_SPEC_VECTORS or mount /spec)")
+	}
+	mb, err := os.ReadFile(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	var man corpusManifest
+	if err := json.Unmarshal(mb, &man); err != nil {
+		t.Fatalf("manifest parse: %v", err)
+	}
+	if man.Version != 1 && man.Version != 2 {
+		t.Fatalf("corpus schema version %d outside the accepted set {1,2}", man.Version)
+	}
+	if man.Version == 2 && len(man.Ledger) == 0 {
+		t.Fatalf("corpus schema version 2 carries no ledger block")
+	}
+	if len(man.Ledger) == 0 {
+		t.Skip("no ledger block to consume")
+	}
+	byID := map[string]*corpusVector{}
+	for _, v := range loadCorpus(t) {
+		byID[v.ID] = v
+	}
+	catOf := map[string]string{}
+	for _, mv := range man.Vectors {
+		catOf[mv.ID] = mv.Category
+	}
+	for _, r := range man.Ledger {
+		switch r.Level {
+		case "F":
+			v := byID[r.Test]
+			cat := catOf[r.Test]
+			if v == nil || cat == "" {
+				t.Fatalf("ledger row cites unknown fixture %s", r.Test)
+			}
+			if class := ledgerFixtureClass(t, root, cat); class != "vector" {
+				t.Fatalf("ledger row %s: unknown fixture class %q", r.Test, class)
+			}
+			materializeLedgerVector(t, v)
+		case "I":
+			// the live-test existence check is the lint's cross-repo leg
+		default:
+			t.Fatalf("ledger row %s: level %q", r.Test, r.Level)
+		}
+	}
+	// fixture classes of the corpus: every declaration-carrying
+	// category validates its census vocabulary (the fixed-vector class
+	// rides the rows above)
+	for _, cat := range man.Categories {
+		name := filepath.Base(cat.File)
+		name = name[:len(name)-len(".json")]
+		if ledgerFixtureClass(t, root, name) == "census" {
+			materializeLedgerCensus(t, root, name)
+		}
+	}
 }
 
 func corpusLimits(v *corpusVector) gbon.Limits {
@@ -697,10 +876,14 @@ func (b *irBuilder) buildBlob(n map[string]any) (reflect.Value, error) {
 }
 
 // buildBacking builds an array node (dense elements + implicit zero tail)
-// or a view node (slice window over the backing, extent as capacity).
+// or a view node (slice window over the backing, extent as capacity). An
+// array node carrying a backing ref is an array-grain window over shared
+// storage: a plain slice window, converted to the array-pointer grain by
+// the consuming field.
 func (b *irBuilder) buildBacking(n map[string]any) (reflect.Value, error) {
 	var target map[string]any
-	if nodeKind(n) == "view" {
+	grain := nodeKind(n) == "array" && n["backing"] != nil
+	if nodeKind(n) == "view" || grain {
 		t, ok := b.resolve(n["backing"])
 		if !ok {
 			return reflect.Value{}, fmt.Errorf("view without backing")
@@ -729,10 +912,13 @@ func (b *irBuilder) buildBacking(n map[string]any) (reflect.Value, error) {
 	if err != nil {
 		return reflect.Value{}, err
 	}
-	if nodeKind(n) == "array" {
+	if nodeKind(n) == "array" && !grain {
 		return arr, nil
 	}
 	off, ln, ext := irInt(n, "off"), irInt(n, "len"), irInt(n, "extent")
+	if grain {
+		return arr.Slice(off, off+ln), nil
+	}
 	sl := arr.Slice3(off, off+ln, off+ext)
 	return sl, nil
 }
@@ -878,7 +1064,12 @@ func (b *irBuilder) buildStruct(n map[string]any) (reflect.Value, error) {
 			}
 		}
 		if bv.Type() != fv.Type() {
-			if fv.Kind() == reflect.Pointer && bv.Kind() != reflect.Pointer && bv.CanAddr() {
+			if fv.Kind() == reflect.Pointer && fv.Type().Elem().Kind() == reflect.Array &&
+				bv.Kind() == reflect.Slice && bv.Type().ConvertibleTo(fv.Type()) {
+				// an array-grain window materializes as the slice-to-
+				// array-pointer conversion, aliasing the backing
+				bv = bv.Convert(fv.Type())
+			} else if fv.Kind() == reflect.Pointer && bv.Kind() != reflect.Pointer && bv.CanAddr() {
 				bv = bv.Addr()
 			} else if bv.Type().ConvertibleTo(fv.Type()) {
 				bv = bv.Convert(fv.Type())
