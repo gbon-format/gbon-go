@@ -821,17 +821,17 @@ func TestRingEncodedBytesStable(t *testing.T) {
 	u1 := &v3x
 	u2 := &u1
 	v3x = &u2
-	pin3 := "67626f6e0000d56c0f2a2a2a696e74657266616365207b7d" +
+	pin3 := "67626f6e0001d56c0f2a2a2a696e74657266616365207b7d" +
 		"d56c0e2a2a696e74657266616365207b7dd56c0d2a696e74657266616365207b7d" +
-		"d66c0c696e74657266616365207b7dc0c8"
+		"d66c0c696e74657266616365207b7dc2c4c0c8"
 	if got := fmt.Sprintf("%x", mustMarshal(t, v3x)); got != pin3 {
-		t.Fatalf("depth-3 anchor: %s", got)
+		t.Fatalf("depth-3 anchor: %s (len %d, want %d)", got, len(got), len(pin3))
 	}
 	var w1x any
 	w2x := &w1x
 	w1x = &w2x
-	pin2 := "67626f6e0000d56c0e2a2a696e74657266616365207b7d" +
-		"d56c0d2a696e74657266616365207b7dd66c0c696e74657266616365207b7dc0c6"
+	pin2 := "67626f6e0001d56c0e2a2a696e74657266616365207b7d" +
+		"d56c0d2a696e74657266616365207b7dd66c0c696e74657266616365207b7dc2c0c6"
 	if got := fmt.Sprintf("%x", mustMarshal(t, w1x)); got != pin2 {
 		t.Fatalf("depth-2 anchor: %s", got)
 	}
@@ -861,11 +861,14 @@ func TestRingNegativeOutcomes(t *testing.T) {
 		t.Fatalf("named miss: hint text %q", err.Error())
 	}
 
-	// incomplete registry: the double-pointer payload misses at depth
+	// incomplete registry: an unregistered concrete payload misses
+	// (the derivation reaches only the registry, the target-tree pool,
+	// and pointer entries registered there)
 	a := &rgAN{}
 	b := &rgAN{}
 	a.Next = b
-	b.Box = &a
+	lead := &rgLeadInt{}
+	b.Box = &lead
 	ib := mustMarshal(t, a)
 	dec := gbon.NewDecoder(bytes.NewReader(ib))
 	if err := dec.Register(rgAN{}, &rgAN{}); err != nil {
@@ -964,8 +967,8 @@ func TestRingNegativeOutcomes(t *testing.T) {
 	if !errors.As(err, &ge) || ge.Class() != "bad_ref" {
 		t.Fatalf("lead mismatch: %v", err)
 	}
-	if want := fmt.Sprintf("ref 4 is not a %s target", reflect.TypeFor[*rgLeadInt]()); !strings.Contains(err.Error(), want) {
-		t.Fatalf("lead mismatch: text %q, want %q", err.Error(), want)
+	if !strings.Contains(err.Error(), "is not a descriptor") {
+		t.Fatalf("lead mismatch: text %q, want the descriptor reject", err.Error())
 	}
 
 	// a REF to a string record in a pointer position stays bad_ref, literal
@@ -978,7 +981,7 @@ func TestRingNegativeOutcomes(t *testing.T) {
 	if !errors.As(err, &ge) || ge.Class() != "bad_ref" {
 		t.Fatalf("foreign sort: %v", err)
 	}
-	if want := fmt.Sprintf("wire: ref %d is not an object record", strRec.id); !strings.Contains(err.Error(), want) {
+	if want := fmt.Sprintf("wire: ref %d is not a descriptor", strRec.id); !strings.Contains(err.Error(), want) {
 		t.Fatalf("foreign sort: text %q, want %q", err.Error(), want)
 	}
 }

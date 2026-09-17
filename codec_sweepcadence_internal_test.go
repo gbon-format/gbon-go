@@ -27,8 +27,8 @@ func TestSweepCadenceLiveTableBoundedWork(t *testing.T) {
 		t.Fatalf("Encode live2: %v", err)
 	}
 	total := len(nodes)
-	if len(e.ptrs) != total {
-		t.Fatalf("live table lost entries: %d, want %d", len(e.ptrs), total)
+	if len(e.grains) != total {
+		t.Fatalf("live table lost entries: %d, want %d", len(e.grains), total)
 	}
 	maxProbes := int64(total/sweepProbeEvery+1) * sweepProbeSample
 	if e.probeWork > maxProbes {
@@ -73,19 +73,19 @@ func TestSweepCadenceDeadBurstSampleSweep(t *testing.T) {
 		t.Fatalf("sample sweep did not fire on dead-majority table (sweeps=%d)", e.sweeps)
 	}
 	dead := 0
-	for _, ent := range e.ptrs {
-		if ent.wp.Value() == nil {
+	for _, rec := range e.grains {
+		if rec.wp.Value() == nil {
 			dead++
 		}
 	}
 	if dead != 0 {
 		t.Fatalf("post-sweep table holds %d dead entries", dead)
 	}
-	if len(e.ptrs) < len(fresh) {
-		t.Fatalf("fresh live entries lost: %d", len(e.ptrs))
+	if len(e.grains) < len(fresh) {
+		t.Fatalf("fresh live entries lost: %d", len(e.grains))
 	}
 	for _, n := range fresh {
-		if _, hit := e.ptrs[uintptr(unsafe.Pointer(n))]; !hit {
+		if _, hit := e.grains[uintptr(unsafe.Pointer(n))]; !hit {
 			t.Fatalf("fresh entry missing after sample sweep")
 		}
 	}

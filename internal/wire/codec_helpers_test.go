@@ -34,7 +34,7 @@ func TestWriteRawBytesAndFlushTo(t *testing.T) {
 	if err := w.FlushTo(&buf); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(buf.Bytes(), []byte{0x67, 0x62, 0x6F, 0x6E, 0x00, 0x00, 0xAB, 0xCD}) {
+	if !bytes.Equal(buf.Bytes(), []byte{0x67, 0x62, 0x6F, 0x6E, 0x00, 0x01, 0xAB, 0xCD}) {
 		t.Fatalf("flushed % x", buf.Bytes())
 	}
 	// drain leaves an empty buffer; a second flush writes nothing

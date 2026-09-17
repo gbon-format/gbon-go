@@ -647,8 +647,8 @@ func TestPtrToIfaceRefNegatives(t *testing.T) {
 	if !errors.As(err, &be) || be.Class() != "bad_ref" {
 		t.Fatalf("(b): want class bad_ref, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "is not an object record") {
-		t.Fatalf("(b): want the object-record text, got %v", err)
+	if !strings.Contains(err.Error(), "is not a descriptor") {
+		t.Fatalf("(b): want the descriptor text, got %v", err)
 	}
 
 	// (c) map nil selector in a pointer-to-interface body

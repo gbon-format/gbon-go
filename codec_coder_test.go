@@ -738,8 +738,8 @@ func TestMinorVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := coderUnhex(t, "67626F6E0000"+"D1655B5D696E74"+"D863696E7408"+"82022224"+"9004")
-	if len(got) != len(want) || got[5] != 0x00 {
+	want := coderUnhex(t, "67626F6E0001"+"D1655B5D696E74"+"D863696E7408"+"82022224"+"9004")
+	if len(got) != len(want) || got[5] != 0x01 {
 		t.Fatalf("stream shape changed: % x", got)
 	}
 	if !bytes.Equal(got, want) {

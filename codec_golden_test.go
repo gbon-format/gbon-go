@@ -26,7 +26,7 @@ type Blank struct {
 	X int
 }
 
-var hdr = []byte{0x67, 0x62, 0x6F, 0x6E, 0x00, 0x00}
+var hdr = []byte{0x67, 0x62, 0x6F, 0x6E, 0x00, 0x01}
 
 func mustMarshal(t *testing.T, v any) []byte {
 	t.Helper()
@@ -294,22 +294,22 @@ var goldenCrossValue = []struct {
 		b := []byte{0xAA}
 		_ = e.Encode(b)
 		_ = e.Encode(b)
-	}, "67626F6E0000 DC0D665B5D62797465 7101AA9002 C09002"},
+	}, "67626F6E0001 DC0D665B5D62797465 7101AA9002 C09002"},
 	{"g53 sub window", func(e *gbon.Encoder) {
 		v := []byte{01, 02, 03, 00}
 		_ = e.Encode(v)
 		_ = e.Encode(v[1:3])
-	}, "67626F6E0000 DC0D665B5D62797465 74030102039002 C09202010203"},
+	}, "67626F6E0001 DC0D665B5D62797465 74030102039002 C09202010203"},
 	{"g54 tail mutation fallback", func(e *gbon.Encoder) {
 		v := []byte{01, 02, 00, 00}
 		_ = e.Encode(v)
 		v[2] = 0xAA
 		_ = e.Encode(v)
-	}, "67626F6E0000 DC0D665B5D62797465 740201029002 C074030102AA9003"},
+	}, "67626F6E0001 DC0D665B5D62797465 740201029002 C074030102AA9003"},
 	{"g55 zerobase dedup", func(e *gbon.Encoder) {
 		_ = e.Encode([]byte{})
 		_ = e.Encode([]byte{})
-	}, "67626F6E0000 DC0D665B5D62797465 70009002 C09002"},
+	}, "67626F6E0001 DC0D665B5D62797465 70009002 C09002"},
 }
 
 func TestGoldenCrossValue(t *testing.T) {
@@ -380,8 +380,8 @@ func TestGoldenBigintMarshal(t *testing.T) {
 			if !bytes.HasPrefix(b, hdr) {
 				t.Fatalf("missing stream header: % x", b)
 			}
-			if b[5] != 0x00 {
-				t.Fatalf("header minor = %#x, want 00", b[5])
+			if b[5] != 0x01 {
+				t.Fatalf("header minor = %#x, want 01", b[5])
 			}
 			wb, err := hex.DecodeString(strings.ReplaceAll(tc.want, " ", ""))
 			if err != nil {
@@ -423,7 +423,7 @@ func TestGoldenV0LLegacyBigint(t *testing.T) {
 	}
 	// re-encode of the adapter-read value is the canonical kind-15 spelling
 	cb := mustMarshal(t, gotp)
-	want := append(append([]byte{0x67, 0x62, 0x6F, 0x6E, 0x00, 0x00},
+	want := append(append([]byte{0x67, 0x62, 0x6F, 0x6E, 0x00, 0x01},
 		0xDC, 0x0F, 0x67, 'b', 'i', 'g', '.', 'I', 'n', 't'), 0x0A)
 	if !bytes.Equal(cb, want) {
 		t.Fatalf("re-encode:\n got  % x\n want % x", cb, want)

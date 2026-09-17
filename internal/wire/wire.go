@@ -85,8 +85,10 @@ const (
 	// Major is the format major version (breaking changes).
 	// Major 0 is the draft era of the format.
 	Major uint8 = 0
-	// Minor is the format minor version (additive changes).
-	Minor uint8 = 0
+	// Minor is the format minor version (additive changes). Minor 1
+	// graduates the zero-size marker selector and the canonical-grain
+	// record rule.
+	Minor uint8 = 1
 )
 
 // First-byte classes: the high nibble of the first token byte.

@@ -112,14 +112,6 @@ func (e *codecEncoder) alive(k uintptr, ent weakID, table map[uintptr]weakID) (u
 	return ent.id, true
 }
 
-// internPtr records a pointer identity under the object address. The
-// weak handle aliases the object through its first byte, so it lives
-// and dies with the whole object.
-func (e *codecEncoder) internPtr(p unsafe.Pointer, id uint64) {
-	e.ptrs[uintptr(p)] = weakID{id: id, ep: e.encEp, wp: weak.Make[byte]((*byte)(p))}
-	e.noteInternInsert()
-}
-
 // internMap records a map identity under the map header address.
 func (e *codecEncoder) internMap(p unsafe.Pointer, id uint64) {
 	e.maps[uintptr(p)] = weakID{id: id, ep: e.encEp, wp: weak.Make[byte]((*byte)(p))}
@@ -143,19 +135,19 @@ func (e *codecEncoder) noteInternInsert() {
 	if e.inserts%sweepProbeEvery != 0 {
 		return
 	}
-	if e.inserts >= sweepMaxInserts && e.inserts >= uint64(len(e.ptrs)+len(e.maps)) {
+	if e.inserts >= sweepMaxInserts && e.inserts >= uint64(len(e.grains)+len(e.maps)) {
 		e.sweepDeadInterns()
 		return
 	}
 	dead, live := 0, 0
 	n := 0
-	for _, ent := range e.ptrs {
+	for _, rec := range e.grains {
 		if n == sweepProbeSample/2 {
 			break
 		}
 		n++
 		e.probeWork++
-		if ent.wp.Value() == nil {
+		if rec.wp.Value() == nil {
 			dead++
 		} else {
 			live++
@@ -182,9 +174,9 @@ func (e *codecEncoder) noteInternInsert() {
 // sweepDeadInterns evicts entries whose weak handle has cleared.
 func (e *codecEncoder) sweepDeadInterns() {
 	e.sweeps++
-	for k, ent := range e.ptrs {
-		if ent.wp.Value() == nil {
-			delete(e.ptrs, k)
+	for k, rec := range e.grains {
+		if rec.wp.Value() == nil {
+			delete(e.grains, k)
 		}
 	}
 	for k, ent := range e.maps {
@@ -232,8 +224,10 @@ func effEncodeLimits(l Limits) Limits {
 type codecEncoder struct {
 	w           *wire.Writer
 	types       map[reflect.Type]typeEntry
-	ptrs        map[uintptr]weakID
 	maps        map[uintptr]weakID
+	grains      map[uintptr]*grainRec // canonical-grain records by address
+	gscan       map[uintptr][]reflect.Type
+	pendingRec  *grainRec
 	inserts     uint64 // intern insertions since the last dead-entry sweep
 	sweeps      uint64 // dead-entry sweeps executed this stream
 	probeWork   int64  // sample liveness probes in the sweep cadence
@@ -659,8 +653,9 @@ func newCodecEncoder() *codecEncoder {
 	e := &codecEncoder{
 		w:         wire.NewWriter(),
 		types:     make(map[reflect.Type]typeEntry),
-		ptrs:      make(map[uintptr]weakID),
 		maps:      make(map[uintptr]weakID),
+		grains:    make(map[uintptr]*grainRec),
+		gscan:     make(map[uintptr][]reflect.Type),
 		coderTags: make(map[reflect.Type]uint64),
 		classIx:   make(map[groupClass]*classIndex),
 		slotIx:    make(map[slotKey]int32),
@@ -1184,6 +1179,11 @@ func (e *codecEncoder) encodeSub(v any) error {
 	if err := e.scanValue(reflect.ValueOf(v)); err != nil {
 		return err
 	}
+	clear(e.gscan)
+	e.hdrEp++
+	if err := e.grainScan(reflect.ValueOf(v), newVisitedSet(), e.planFor(reflect.TypeOf(v))); err != nil {
+		return err
+	}
 	return e.encodeValue(reflect.ValueOf(v), pathNode{idx: -1})
 }
 
@@ -1239,8 +1239,11 @@ func (e *codecEncoder) resetForPool(src *codecEncoder) {
 		e.scopeEpoch = 0
 	}
 	clear(e.types)
-	clear(e.ptrs)
 	clear(e.maps)
+	clear(e.grains)
+	clear(e.gscan)
+	e.hdrEp++
+	e.pendingRec = nil
 	e.inserts = 0
 	e.sweeps = 0
 	e.probeWork = 0
@@ -1291,6 +1294,10 @@ func (e *codecEncoder) encodeRoot(v any) error {
 	}
 	e.gen++
 	if err := e.scanValue(reflect.ValueOf(v)); err != nil {
+		return err
+	}
+	clear(e.gscan)
+	if err := e.grainScan(reflect.ValueOf(v), newVisitedSet(), e.planFor(reflect.TypeOf(v))); err != nil {
 		return err
 	}
 	return e.encodeValue(reflect.ValueOf(v), pathNode{idx: -1})
@@ -1425,6 +1432,11 @@ func (e *codecEncoder) encodeBody(v reflect.Value, p pathNode) error {
 	if e.depth > e.lim.MaxDepth {
 		e.depth--
 		return errBudget(classBudgetDepth, -1, p.String(), nil, e.lim.MaxDepth, errDetail(fmt.Sprintf("output depth exceeds MaxDepth budget %d", e.lim.MaxDepth)))
+	}
+	if e.pendingRec != nil {
+		rec := e.pendingRec
+		e.pendingRec = nil
+		rec.open = true
 	}
 	err := e.encodeBodyInner(v, p)
 	e.depth--
@@ -3493,24 +3505,301 @@ func keyPtrSeqLess(a, b []uintptr) bool {
 	return len(a) < len(b)
 }
 
-// encodePointer writes a pointer body: nil selector, REF on a repeated
-// target, or a reserved id (registration before children)
-// followed by the pointee body. Zero-size targets are not tracked.
+// grainRec is the canonical-grain record of one address: the record's
+// grain type, its intern id, and whether the record body has started
+// (the first body token is on the wire).
+type grainRec struct {
+	grain reflect.Type
+	id    uint64
+	wp    weak.Pointer[byte]
+	open  bool
+}
+
+// normalizeGrain reduces a named type to its unnamed layout equivalent
+// (the reflect-visible form of the underlying type): grains of one
+// address that differ only by named conversions share one normalized
+// record. Types whose clone is unbuildable (unexported fields, methoded
+// interfaces, funcs) keep their name.
+func normalizeGrain(t reflect.Type) reflect.Type {
+	if t.Name() == "" {
+		return t
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		fs := make([]reflect.StructField, t.NumField())
+		for i := range fs {
+			f := t.Field(i)
+			if f.PkgPath != "" {
+				return t
+			}
+			fs[i] = reflect.StructField{Name: f.Name, Type: f.Type, Tag: f.Tag, Anonymous: f.Anonymous}
+		}
+		return reflect.StructOf(fs)
+	case reflect.Pointer:
+		return reflect.PointerTo(t.Elem())
+	case reflect.Slice:
+		return reflect.SliceOf(t.Elem())
+	case reflect.Array:
+		return reflect.ArrayOf(t.Len(), t.Elem())
+	case reflect.Map:
+		return reflect.MapOf(t.Key(), t.Elem())
+	case reflect.Chan:
+		return reflect.ChanOf(t.ChanDir(), t.Elem())
+	case reflect.Bool:
+		return reflect.TypeFor[bool]()
+	case reflect.String:
+		return reflect.TypeFor[string]()
+	case reflect.Int:
+		return reflect.TypeFor[int]()
+	case reflect.Int8:
+		return reflect.TypeFor[int8]()
+	case reflect.Int16:
+		return reflect.TypeFor[int16]()
+	case reflect.Int32:
+		return reflect.TypeFor[int32]()
+	case reflect.Int64:
+		return reflect.TypeFor[int64]()
+	case reflect.Uint:
+		return reflect.TypeFor[uint]()
+	case reflect.Uint8:
+		return reflect.TypeFor[uint8]()
+	case reflect.Uint16:
+		return reflect.TypeFor[uint16]()
+	case reflect.Uint32:
+		return reflect.TypeFor[uint32]()
+	case reflect.Uint64:
+		return reflect.TypeFor[uint64]()
+	case reflect.Uintptr:
+		return reflect.TypeFor[uintptr]()
+	case reflect.Float32:
+		return reflect.TypeFor[float32]()
+	case reflect.Float64:
+		return reflect.TypeFor[float64]()
+	case reflect.Complex64:
+		return reflect.TypeFor[complex64]()
+	case reflect.Complex128:
+		return reflect.TypeFor[complex128]()
+	}
+	return t
+}
+
+// grainDerivable reports whether target is reachable from grain by
+// descent over struct fields with Offset==0 (blank fields excluded) and
+// array element 0.
+func grainDerivable(grain, target reflect.Type) bool {
+	if grain == target {
+		return true
+	}
+	switch grain.Kind() {
+	case reflect.Struct:
+		for i := 0; i < grain.NumField(); i++ {
+			f := grain.Field(i)
+			if f.Name == "_" || f.Offset != 0 {
+				continue
+			}
+			if grainDerivable(f.Type, target) {
+				return true
+			}
+		}
+	case reflect.Array:
+		if grainDerivable(grain.Elem(), target) {
+			return true
+		}
+	}
+	return false
+}
+
+// grainScan walks the root's reference graph and accumulates the tracked
+// grain set of every address: one entry per pointer position whose
+// pointee is non-zero-size. Descent stops at repeated pointee or map
+// addresses; the grain of a repeated address still accumulates.
+func (e *codecEncoder) grainScan(v reflect.Value, visited *visitedSet, pl *typePlan) error {
+	e.depth++
+	if e.depth > e.lim.MaxDepth {
+		e.depth--
+		return errBudget(classBudgetDepth, -1, "", nil, e.lim.MaxDepth, errDetail(fmt.Sprintf("output depth exceeds MaxDepth budget %d", e.lim.MaxDepth)))
+	}
+	err := e.grainScanInner(v, visited, pl)
+	e.depth--
+	return err
+}
+
+func (e *codecEncoder) grainScanInner(v reflect.Value, visited *visitedSet, pl *typePlan) error {
+	switch pl.op {
+	case opCoder:
+		return nil
+	case opBlob, opSlice:
+		if v.IsNil() {
+			return nil
+		}
+		if e.visitHdr(hdrKey{ptr: v.Pointer(), len: v.Len(), cap: v.Cap()}) {
+			return nil
+		}
+		if pl.elemScan {
+			for i := 0; i < v.Len(); i++ {
+				if err := e.grainScan(v.Index(i), visited, pl.elem); err != nil {
+					return err
+				}
+			}
+		}
+	case opArray:
+		if pl.elemScan {
+			for i := 0; i < v.Len(); i++ {
+				if err := e.grainScan(v.Index(i), visited, pl.elem); err != nil {
+					return err
+				}
+			}
+		}
+	case opStruct:
+		for i := range pl.scanFields {
+			f := &pl.scanFields[i]
+			if err := e.grainScan(v.Field(int(f.idx)), visited, f.plan); err != nil {
+				return err
+			}
+		}
+	case opMap:
+		if v.IsNil() || visited.visitScalar(v.Pointer()) {
+			return nil
+		}
+		if pl.keyFree && pl.valFree {
+			return nil
+		}
+		iter := v.MapRange()
+		for iter.Next() {
+			if err := e.grainScan(iter.Key(), visited, pl.keyPlan); err != nil {
+				return err
+			}
+			if err := e.grainScan(iter.Value(), visited, pl.valPlan); err != nil {
+				return err
+			}
+		}
+	case opPointer:
+		if !v.IsNil() && !pl.elemZero {
+			addr := v.Pointer()
+			e.gscan[addr] = append(e.gscan[addr], v.Type().Elem())
+			if visited.visitScalar(addr) {
+				return nil
+			}
+			if err := e.grainScan(v.Elem(), visited, pl.elem); err != nil {
+				return err
+			}
+		}
+	case opInterface:
+		if !v.IsNil() {
+			if err := e.grainScan(v.Elem(), visited, e.planFor(v.Elem().Type())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// canonicalGrain reduces the scanned grain set of one address to the
+// coarsest grain; fallback applies when the position itself is the only
+// contributor (a lazy scan miss). Incomparable grains are a loud
+// unsupported: layout normalization has collapsed the named-conversion
+// class, so a surviving incomparability is outside well-typed graphs.
+func (e *codecEncoder) canonicalGrain(addr uintptr, fallback reflect.Type, p pathNode) (reflect.Type, error) {
+	set := e.gscan[addr]
+	c := fallback
+	for _, g := range set {
+		if c == g || grainDerivable(c, g) {
+			continue
+		}
+		if normalizeGrain(c) == normalizeGrain(g) {
+			c = normalizeGrain(c)
+			continue
+		}
+		if grainDerivable(g, c) {
+			c = g
+			continue
+		}
+		return nil, errUnsupported(classBadRef, p.String(), c, g, errDetail("incomparable grains at one address"))
+	}
+	return c, nil
+}
+
+// grainCompatible reports whether a position of static pointee elem can
+// resolve against a record of the given grain: direct derivability, or
+// the named-conversion collapse of identical underlying layout.
+func grainCompatible(grain, elem reflect.Type) bool {
+	return grain == elem ||
+		grainDerivable(grain, elem) ||
+		grainDerivable(grain, normalizeGrain(elem)) ||
+		normalizeGrain(grain) == normalizeGrain(elem)
+}
+
+// encodePointer writes a pointer position: the nil selector, the
+// zero-size marker, a naked REF to an open record, or the record opening
+// — the grain tag when the canonical grain differs from the position's
+// static pointee type, the body directly when equal. The record id is
+// reserved immediately before the body; a REF only ever names a record
+// whose body has started.
 func (e *codecEncoder) encodePointer(v reflect.Value, p pathNode) error {
 	if v.IsNil() {
 		return e.w.WriteNil(wire.NilPointer)
 	}
-	if v.Type().Elem().Size() != 0 {
-		p := v.UnsafePointer()
-		k := uintptr(p)
-		if ent, hit := e.ptrs[k]; hit {
-			if id, live := e.alive(k, ent, e.ptrs); live {
-				return e.w.WriteRef(id)
+	elem := v.Type().Elem()
+	if elem.Size() == 0 {
+		return e.w.WriteNil(wire.NilZeroSize)
+	}
+	addr := v.Pointer()
+	if rec, hit := e.grains[addr]; hit {
+		if rec.wp.Value() != nil {
+			if !rec.open {
+				return errFormat(classBadRef, -1, p.String(), nil, nil, errDetail("ref to a record whose body has not started"))
+			}
+			if !grainCompatible(rec.grain, elem) {
+				return errUnsupported(classBadRef, p.String(), rec.grain, elem, errDetail("cross-value grain coarsening unsupported"))
+			}
+			return e.w.WriteRef(rec.id)
+		}
+		delete(e.grains, addr)
+	}
+	cg, err := e.canonicalGrain(addr, elem, p)
+	if err != nil {
+		return err
+	}
+	// a pointer-grain record whose body would open with a naked REF
+	// carries the grain tag even at grain equality: the elided form is
+	// byte-indistinguishable from a naked repeat (clause 2a)
+	selfTag := cg == elem && cg.Kind() == reflect.Pointer
+	if selfTag {
+		inner := v.Elem()
+		selfTag = inner.Kind() != reflect.Pointer || !inner.IsNil()
+	}
+	if cg != elem || selfTag {
+		if err := e.writeDescOf(cg, p); err != nil {
+			return err
+		}
+	}
+	// interface-grain openings never emit the dynamic reading of a
+	// degenerate payload form (a dynamic type carrying the position
+	// grain through its leading fields): the tag reading is the only
+	// emission, keeping the stream unambiguous
+	if cg == elem && elem.Kind() == reflect.Interface {
+		if dv := v.Elem(); dv.Kind() != reflect.Interface {
+			if dt := dv.Type(); grainCompatible(dt, elem) {
+				if err := e.writeDescOf(dt, p); err != nil {
+					return err
+				}
+				cg = dt
 			}
 		}
-		e.internPtr(p, e.w.ReserveID())
 	}
-	return e.encodeBody(v.Elem(), p)
+	up := v.UnsafePointer()
+	rec := &grainRec{grain: cg, wp: weak.Make[byte]((*byte)(up))}
+	rec.id = e.w.ReserveID()
+	e.grains[addr] = rec
+	e.noteInternInsert()
+	e.pendingRec = rec
+	if cg == elem {
+		return e.encodeBody(v.Elem(), p)
+	}
+	if dv := v.Elem(); dv.IsValid() && dv.Type() == cg {
+		return e.encodeBody(dv, p)
+	}
+	return e.encodeBody(reflect.NewAt(cg, up).Elem(), p)
 }
 
 // growForRoot reserves output capacity from the root value's shape: a

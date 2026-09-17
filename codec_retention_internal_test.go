@@ -67,13 +67,13 @@ func TestRetentionRepeatsGetSameRef(t *testing.T) {
 	e := newCodecEncoder()
 	shared := &retentionNode{Val: 7, Name: "shared"}
 	if err := e.Encode([]*retentionNode{shared, shared, shared}); err != nil {
-		t.Fatalf("Encode ptrs: %v", err)
+		t.Fatalf("Encode pointers: %v", err)
 	}
-	ent, hit := e.ptrs[uintptr(unsafe.Pointer(shared))]
-	if !hit || ent.wp.Value() == nil {
+	rec, hit := e.grains[uintptr(unsafe.Pointer(shared))]
+	if !hit || rec.wp.Value() == nil {
 		t.Fatalf("shared node not interned live")
 	}
-	if n := retentionCountRef(e.w.Bytes(), ent.id); n != 2 {
+	if n := retentionCountRef(e.w.Bytes(), rec.id); n != 2 {
 		t.Fatalf("repeat meetings: %d REF tokens, want 2", n)
 	}
 
@@ -97,14 +97,14 @@ func TestRetentionRepeatsGetSameRef(t *testing.T) {
 func TestRetentionDeadEntryIsMiss(t *testing.T) {
 	e := newCodecEncoder()
 	dead := retentionDrop(t, e)
-	ent, hit := e.ptrs[dead]
+	rec, hit := e.grains[dead]
 	if !hit {
 		t.Fatalf("dead entry missing from table")
 	}
-	if ent.wp.Value() != nil {
+	if rec.wp.Value() != nil {
 		t.Fatalf("weak handle still live after drop+GC")
 	}
-	deadID := ent.id
+	deadID := rec.id
 
 	// New object on a recycled address (when the allocator reuses it)
 	// or a fresh address: either way a fresh id, never the dead one.
@@ -112,15 +112,15 @@ func TestRetentionDeadEntryIsMiss(t *testing.T) {
 	if err := e.Encode([]*retentionNode{q}); err != nil {
 		t.Fatalf("Encode newcomer: %v", err)
 	}
-	entQ, hitQ := e.ptrs[uintptr(unsafe.Pointer(q))]
-	if !hitQ || entQ.wp.Value() == nil {
+	recQ, hitQ := e.grains[uintptr(unsafe.Pointer(q))]
+	if !hitQ || recQ.wp.Value() == nil {
 		t.Fatalf("newcomer not interned live")
 	}
-	if entQ.id == deadID {
+	if recQ.id == deadID {
 		t.Fatalf("newcomer claimed the dead id %d", deadID)
 	}
 	if addrQ := uintptr(unsafe.Pointer(q)); addrQ == dead {
-		if e.ptrs[dead].id == deadID {
+		if e.grains[dead].id == deadID {
 			t.Fatalf("dead entry not overwritten on address reuse")
 		}
 	}
@@ -138,20 +138,20 @@ func TestRetentionZeroSizeNotTracked(t *testing.T) {
 	if err := e.Encode([]*struct{ X struct{} }{z, z}); err != nil {
 		t.Fatalf("Encode zero-size: %v", err)
 	}
-	if _, hit := e.ptrs[uintptr(unsafe.Pointer(z))]; hit {
-		t.Fatalf("zero-size pointee tracked in ptrs")
+	if _, hit := e.grains[uintptr(unsafe.Pointer(z))]; hit {
+		t.Fatalf("zero-size pointee tracked in grains")
 	}
-	if len(e.ptrs) != 0 {
-		t.Fatalf("ptrs table not empty: %d entries", len(e.ptrs))
+	if len(e.grains) != 0 {
+		t.Fatalf("ptrs table not empty: %d entries", len(e.grains))
 	}
 
 	e2 := newCodecEncoder()
 	b1, b2 := new(byte), new(byte)
 	if err := e2.Encode([]*byte{b1, b2}); err != nil {
-		t.Fatalf("Encode byte ptrs: %v", err)
+		t.Fatalf("Encode byte pointers: %v", err)
 	}
-	if len(e2.ptrs) != 2 {
-		t.Fatalf("one-byte pointees: %d table entries, want 2", len(e2.ptrs))
+	if len(e2.grains) != 2 {
+		t.Fatalf("one-byte pointees: %d table entries, want 2", len(e2.grains))
 	}
 }
 
@@ -165,21 +165,21 @@ func TestRetentionSweepHygiene(t *testing.T) {
 		t.Fatalf("Encode live: %v", err)
 	}
 	liveAddr := uintptr(unsafe.Pointer(live))
-	beforeID := e.ptrs[liveAddr].id
+	beforeID := e.grains[liveAddr].id
 	dead := retentionDrop(t, e)
-	liveBefore, deadBefore := len(e.ptrs), true
+	liveBefore, deadBefore := len(e.grains), true
 
 	e.sweepDeadInterns()
 
-	if _, hit := e.ptrs[dead]; hit {
+	if _, hit := e.grains[dead]; hit {
 		t.Fatalf("dead entry survived sweep")
 	}
-	if len(e.ptrs) != liveBefore-1 {
-		t.Fatalf("sweep removed %d entries, want exactly 1", liveBefore-len(e.ptrs))
+	if len(e.grains) != liveBefore-1 {
+		t.Fatalf("sweep removed %d entries, want exactly 1", liveBefore-len(e.grains))
 	}
-	ent, hit := e.ptrs[liveAddr]
-	if !hit || ent.id != beforeID || ent.wp.Value() == nil {
-		t.Fatalf("live entry damaged by sweep: hit=%v id=%d->%d", hit, beforeID, ent.id)
+	rec, hit := e.grains[liveAddr]
+	if !hit || rec.id != beforeID || rec.wp.Value() == nil {
+		t.Fatalf("live entry damaged by sweep: hit=%v id=%d->%d", hit, beforeID, rec.id)
 	}
 	_ = deadBefore
 
@@ -207,8 +207,8 @@ func TestRetentionSweepThreshold(t *testing.T) {
 	if err := e.Encode(wave); err != nil {
 		t.Fatalf("Encode wave: %v", err)
 	}
-	if len(e.ptrs) < sweepMaxInserts {
-		t.Fatalf("wave interned %d entries, want >= %d", len(e.ptrs), sweepMaxInserts)
+	if len(e.grains) < sweepMaxInserts {
+		t.Fatalf("wave interned %d entries, want >= %d", len(e.grains), sweepMaxInserts)
 	}
 	for i := range wave {
 		wave[i] = nil
@@ -226,8 +226,8 @@ func TestRetentionSweepThreshold(t *testing.T) {
 		t.Fatalf("Encode wave2: %v", err)
 	}
 	dead := 0
-	for _, ent := range e.ptrs {
-		if ent.wp.Value() == nil {
+	for _, rec := range e.grains {
+		if rec.wp.Value() == nil {
 			dead++
 		}
 	}
@@ -235,12 +235,12 @@ func TestRetentionSweepThreshold(t *testing.T) {
 		t.Fatalf("auto-sweep left %d dead entries in the table", dead)
 	}
 	for _, a := range addrs {
-		if ent, h := e.ptrs[a]; h && ent.wp.Value() == nil {
+		if rec, h := e.grains[a]; h && rec.wp.Value() == nil {
 			t.Fatalf("wave-1 dead entry survived at %x", a)
 		}
 	}
-	if len(e.ptrs) < sweepMaxInserts {
-		t.Fatalf("wave2 lost live entries: %d", len(e.ptrs))
+	if len(e.grains) < sweepMaxInserts {
+		t.Fatalf("wave2 lost live entries: %d", len(e.grains))
 	}
 	runtime.KeepAlive(wave2)
 }
@@ -283,7 +283,7 @@ func TestRetentionMidEncodeGCStability(t *testing.T) {
 	if err := fe.Encode(midGraph{A: shared, P: retentionGCProbe{N: 9}, B: shared}); err != nil {
 		t.Fatalf("Encode mid-GC: %v", err)
 	}
-	id := fe.enc.ptrs[uintptr(unsafe.Pointer(shared))].id
+	id := fe.enc.grains[uintptr(unsafe.Pointer(shared))].id
 	if n := retentionCountRef(buf.Bytes(), id); n != 1 {
 		t.Fatalf("mid-GC graph: %d REF tokens, want 1", n)
 	}
@@ -317,7 +317,7 @@ func TestRetentionInterValueGCWindow(t *testing.T) {
 		if err := e.Encode(p); err != nil {
 			t.Fatalf("Encode v2: %v", err)
 		}
-		id := e.ptrs[uintptr(unsafe.Pointer(p))].id
+		id := e.grains[uintptr(unsafe.Pointer(p))].id
 		p = nil
 		return id
 	}()
@@ -357,11 +357,11 @@ func TestRetentionPBTDagSharing(t *testing.T) {
 			if m < 2 {
 				continue
 			}
-			id, ok := e.ptrs[uintptr(unsafe.Pointer(n))]
+			recR, ok := e.grains[uintptr(unsafe.Pointer(n))]
 			if !ok {
 				t.Fatalf("round %d: referenced node not interned", round)
 			}
-			if got := retentionCountRef(e.w.Bytes(), id.id); got != m-1 {
+			if got := retentionCountRef(e.w.Bytes(), recR.id); got != m-1 {
 				t.Fatalf("round %d: node met %d times emitted %d REFs, want %d", round, m, got, m-1)
 			}
 		}
@@ -437,14 +437,14 @@ func TestRetentionPBTNoDeadRefReuse(t *testing.T) {
 		}
 		before := len(e.w.Bytes())
 		for i := range wave {
-			deadIDs = append(deadIDs, e.ptrs[addrs[i]].id)
+			deadIDs = append(deadIDs, e.grains[addrs[i]].id)
 			wave[i] = nil
 		}
 		runtime.GC()
 		runtime.GC()
 		deadNow := 0
 		for _, a := range addrs {
-			if ent, h := e.ptrs[a]; h && ent.wp.Value() == nil {
+			if rec, h := e.grains[a]; h && rec.wp.Value() == nil {
 				deadNow++
 			}
 		}

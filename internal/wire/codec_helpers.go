@@ -16,6 +16,7 @@ const (
 	ClassView  byte = classView
 	ClassArray byte = classArray
 	ClassBlob  byte = classBlob
+	ClassDesc  byte = classDesc
 )
 
 // entryValue marks a decoder-side object record: a reconstructed pointer
@@ -272,8 +273,38 @@ func (r *Reader) PeekNilKind() (NilKind, bool) {
 		return 0, false
 	}
 	k := NilKind(r.buf[r.pos] & 0x0F)
-	if k > NilInterface {
+	if k > NilZeroSize {
 		return 0, false
 	}
 	return k, true
+}
+
+// NilZeroSize is the zero-size marker selector: a non-nil pointer to a
+// zero-size pointee encodes as this NIL-class token (reserved selector
+// 4, graduated in minor 1).
+const NilZeroSize NilKind = 4
+
+// ReadNilSelector reads a NIL token allowing the graduated selectors
+// (0..3 plus the zero-size marker); other selectors stay malformed.
+func (r *Reader) ReadNilSelector() (NilKind, error) {
+	form, err := r.readFirst(classNil)
+	if err != nil {
+		return 0, err
+	}
+	if form > byte(NilZeroSize) {
+		return 0, werr(kindMalformedOp, "wire: unknown nil selector %d", form)
+	}
+	return NilKind(form), nil
+}
+
+// DescAt returns the descriptor of record id.
+func (r *Reader) DescAt(id uint64) (*Desc, error) {
+	kind, err := r.kindAt(id)
+	if err != nil {
+		return nil, err
+	}
+	if kind != entryDesc {
+		return nil, werr(kindBadRef, "wire: ref %d is not a descriptor", id)
+	}
+	return r.descs[id], nil
 }

@@ -90,6 +90,34 @@ type vecDM struct {
 	S string
 }
 type vecS1 struct{ F1 any }
+type vecGrainS struct{ A int64 }
+type vecGrainBox struct {
+	P *int64
+	Q *vecGrainS
+}
+type vecGrainA struct{ X int64 }
+type vecGrainB struct{ X int64 }
+type vecGrainH struct {
+	PA *vecGrainA
+	PB *vecGrainB
+}
+type vecGrainT struct {
+	H int64
+	L struct{}
+	M int64
+}
+type vecGrainW struct {
+	PL *struct{}
+	PM *int64
+}
+type vecGrainN struct {
+	V    int64
+	Next *vecGrainN
+}
+type vecGrainF struct {
+	Q *bool
+	P *int64
+}
 
 var corpusBindings = []struct {
 	name string
@@ -112,6 +140,25 @@ var corpusBindings = []struct {
 	{"map[*vec.node]int64", map[*vecNode]int64{}},
 	{"main.S1", vecS1{}},
 	{"*main.S1", (*vecS1)(nil)},
+	{"main.S", vecGrainS{}},
+	{"*main.S", (*vecGrainS)(nil)},
+	{"main.Box", vecGrainBox{}},
+	{"*main.Box", (*vecGrainBox)(nil)},
+	{"main.A", vecGrainA{}},
+	{"*main.A", (*vecGrainA)(nil)},
+	{"main.B", vecGrainB{}},
+	{"*main.B", (*vecGrainB)(nil)},
+	{"main.H", vecGrainH{}},
+	{"*main.H", (*vecGrainH)(nil)},
+	{"main.T", vecGrainT{}},
+	{"main.W", vecGrainW{}},
+	{"*main.W", (*vecGrainW)(nil)},
+	{"main.N", vecGrainN{}},
+	{"*main.N", (*vecGrainN)(nil)},
+	{"main.F", vecGrainF{}},
+	{"*main.F", (*vecGrainF)(nil)},
+	{"struct {}", struct{}{}},
+	{"*struct {}", (*struct{})(nil)},
 }
 
 // corpusMapTypes resolves explicit map type names carried by map nodes.
@@ -429,6 +476,21 @@ func (b *irBuilder) buildNode(label string, n map[string]any) (reflect.Value, er
 		return b.buildMap(n)
 	case "struct":
 		return b.buildStruct(n)
+	case "cell":
+		// interior cell: the field l-value of a built struct node
+		if err := b.materialize(irString(n, "of")); err != nil {
+			return reflect.Value{}, err
+		}
+		st, ok := b.storage[irString(n, "of")]
+		if !ok || !st.IsValid() {
+			return reflect.Value{}, fmt.Errorf("cell of %s: no storage", irString(n, "of"))
+		}
+		fl := st.FieldByName(irString(n, "name"))
+		if !fl.IsValid() {
+			return reflect.Value{}, fmt.Errorf("cell field %q not found", irString(n, "name"))
+		}
+		b.storage[label] = fl
+		return fl, nil
 	case "iface":
 		// iface-slot storage: the slot cell registers before its payload
 		// builds, so self-referential payloads resolve through {ref};
@@ -803,6 +865,18 @@ func (b *irBuilder) buildStruct(n map[string]any) (reflect.Value, error) {
 		if !bv.IsValid() {
 			continue
 		}
+		// named-grain conversion: a ref annotated with a bound grain
+		// type materializes through the legal pointer conversion of an
+		// identical-underlying pair, aliasing the target storage
+		if rm, ok := fd["value"].(map[string]any); ok && bv.Kind() != reflect.Pointer {
+			if gname := irString(rm, "type"); gname != "" {
+				if _, gok := b.bindingType(gname); gok && fv.Kind() == reflect.Pointer && bv.CanAddr() {
+					if pt := bv.Addr().Type(); pt != fv.Type() && pt.ConvertibleTo(fv.Type()) {
+						bv = bv.Addr().Convert(fv.Type())
+					}
+				}
+			}
+		}
 		if bv.Type() != fv.Type() {
 			if fv.Kind() == reflect.Pointer && bv.Kind() != reflect.Pointer && bv.CanAddr() {
 				bv = bv.Addr()
@@ -1098,6 +1172,11 @@ var slotRootedCorpusWraps = map[string]int{
 // chainRootedCorpusVector marks the double-pointer chain root.
 func chainRootedCorpusVector(id string) bool { return id == "V-101" }
 
+// zsRootedCorpusVector marks the zero-size-marker root: the root value
+// is the pointer itself (non-nil, zero-size pointee), decoded into its
+// own grain rather than a dereferenced pointee slot.
+func zsRootedCorpusVector(id string) bool { return id == "V-107" }
+
 func runOKVector(t *testing.T, v *corpusVector, data []byte) {
 	// projection degrade: decimal128 is valid on the wire, unsupported here
 	if corpusHasWideFloat(v.rawIR) {
@@ -1123,9 +1202,10 @@ func runOKVector(t *testing.T, v *corpusVector, data []byte) {
 	dv.SetLimits(corpusLimits(v))
 	comp := want
 	slotType := want.Type()
-	if chainRootedCorpusVector(v.ID) {
-		// a double-pointer chain root decodes into its own grain: the
-		// deref comparison of value roots does not apply
+	if chainRootedCorpusVector(v.ID) || zsRootedCorpusVector(v.ID) {
+		// a double-pointer chain root or a zero-size-marker root decodes
+		// into its own grain: the deref comparison of value roots does
+		// not apply
 		comp = want
 	} else if slotType.Kind() == reflect.Pointer && !want.IsNil() {
 		slotType = slotType.Elem()
@@ -1222,6 +1302,9 @@ func renumberIR(ir map[string]any) map[string]any {
 		if l, ok := m["ref"].(string); ok {
 			m["ref"] = rev[l]
 		}
+		if l, ok := m["of"].(string); ok {
+			m["of"] = rev[l]
+		}
 		if bb, ok := m["backing"].(map[string]any); ok {
 			if l, ok := bb["ref"].(string); ok {
 				bb["ref"] = rev[l]
@@ -1255,6 +1338,10 @@ func renumberIR(ir map[string]any) map[string]any {
 	}
 	return cp
 }
+
+// TestCorpusDriftLayerNegativeFixture proves the drift layer's
+// comparison rejects tampered expectations (SB-5 negative fixture): a
+// flipped byte in a loaded expectation must compare unequal.
 
 func runNegativeVector(t *testing.T, v *corpusVector, data []byte, sentinel error) {
 	dv := newCorpusDecoder(data)

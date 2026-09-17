@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0] - 2026-09-16
+
+The canonical-grain revision (minor 1, draft era): the record's grain is
+the coarsest among the tracked grains of its address, computed by an
+encoder pre-scan; every record opens at its canonical grain.
+
+### Added
+
+- Encoder pre-scan of pointer-graph grains with layout normalization
+  (named conversions of identical underlying layout share one record)
+  and the zero-size axiom: non-nil pointers to zero-size pointees
+  encode as the marker selector `0x04`, never interned by address.
+- The grain tag on differing-grain openings (a REF or descriptor
+  literal naming the record's grain before the body), the self-tag on
+  pointer-grain records, and elision at grain equality for non-pointer
+  grains; repeats are naked REFs to open records (the started-body
+  invariant holds by construction with an always-on encoder assert).
+- The zero-size marker selector graduates the reserved NIL-class
+  selector 4 (decode materializes a fresh zero-size allocation).
+- The bounded-exhaustive oracle (`internal/canongrain`): small pointer
+  graphs over a fixed grammar checked for decode success, round-trip
+  identity (zero-size, slice-view, nil-merge, and degenerate-form
+  carve-outs), and byte idempotence.
+- 0.0-stream compatibility: a 0.1 decoder reads 0.0 streams (the
+  version rides the header); interface slots of 0.0 streams keep the
+  container-grain reading through the uniform resolver.
+
+### Changed
+
+- Wire version is 0.1 (header `67 62 6f 6e 00 01`); golden pins
+  carry the current encoder's bytes. The transitional corpus-drift
+  expectation layer was a CYC-G-window mechanism only: it carried the
+  current encoder's bytes for both-vectors whose corpus bytes predated
+  the canonical-grain revision, and it was removed in full when the
+  spec corpus was rebaselined to 0.1 (the released tree carries no
+  such layer).
+
+### Removed
+
+- The decoder's enumeration bridge ladder (`pointerBackref`,
+  `interiorOffsetZero`, `decodePointerCell`, `decodeContainerGrainCell`,
+  `slotGrainContainer`): reference resolution is a single uniform path
+  (record sort, grain tag, offset-zero descent).
+
 ## [0.0.5] - 2026-09-13
 
 ### Changed

@@ -375,8 +375,8 @@ func TestPtrChainIfaceNegatives(t *testing.T) {
 	if !errors.As(err, &ee) || ee.Class() != "bad_ref" {
 		t.Fatalf("(e): want class bad_ref, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "is not an object record") {
-		t.Fatalf("(e): want the object-record text, got %v", err)
+	if !strings.Contains(err.Error(), "is not a descriptor") {
+		t.Fatalf("(e): want the descriptor text, got %v", err)
 	}
 
 	// self-referential tag chain: depth budget fires, never a hang

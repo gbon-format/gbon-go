@@ -61,15 +61,15 @@ func goldenVectors() []goldenVec {
 	return []goldenVec{
 		{
 			name: "header",
-			want: "67 62 6F 6E 00 00",
+			want: "67 62 6F 6E 00 01",
 			enc:  func(w *Writer) error { return w.WriteHeader() },
 			dec: func(r *Reader) error {
 				maj, min, err := r.ReadHeader()
 				if err != nil {
 					return err
 				}
-				if maj != 0 || min != 0 {
-					return fmt.Errorf("header = %d.%d, want 0.0", maj, min)
+				if maj != 0 || min != 1 {
+					return fmt.Errorf("header = %d.%d, want 0.1", maj, min)
 				}
 				return nil
 			},

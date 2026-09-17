@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -71,23 +72,25 @@ func validateLimits(l Limits, isEncode bool) error {
 }
 
 type codecDecoder struct {
-	r        *wire.Reader
-	depth    int
-	shared   map[uint64]reflect.Value // stream-shared materialized backings per record id
-	reg      map[string]reflect.Type  // scoped concrete-type registry
-	coders   map[string]coderEntry    // scoped coder registry
-	binds    *coderBinds              // per-stream tag↔name binds
-	asName   map[reflect.Type]string  // RegisterAs bindings: type → wire name
-	fac      *Decoder                 // public facade for Coder callbacks
-	maxDepth int
-	maxNodes int
-	nodes    int
-	maxPairs uint64
-	maxBytes int
-	start    int        // stream offset where the current value began (MaxBytes)
-	alloc    int        // charged backing-allocation bytes (derived, booked via chargeAlloc)
-	broken   error      // sticky error of facade sub-decodes inside coder bodies
-	shr      *decShared // per-Reader caches: struct plans, coder memo, staging scratch
+	r          *wire.Reader
+	depth      int
+	shared     map[uint64]reflect.Value // stream-shared materialized backings per record id
+	reg        map[string]reflect.Type  // scoped concrete-type registry
+	coders     map[string]coderEntry    // scoped coder registry
+	binds      *coderBinds              // per-stream tag↔name binds
+	asName     map[reflect.Type]string  // RegisterAs bindings: type → wire name
+	grainNames map[string]reflect.Type  // named-type pool from the decoded target trees (grain-tag resolution)
+	legacy     bool                     // 0.0 stream: no grain tags exist — tag hypotheses stay off
+	fac        *Decoder                 // public facade for Coder callbacks
+	maxDepth   int
+	maxNodes   int
+	nodes      int
+	maxPairs   uint64
+	maxBytes   int
+	start      int        // stream offset where the current value began (MaxBytes)
+	alloc      int        // charged backing-allocation bytes (derived, booked via chargeAlloc)
+	broken     error      // sticky error of facade sub-decodes inside coder bodies
+	shr        *decShared // per-Reader caches: struct plans, coder memo, staging scratch
 }
 
 // decShared is the per-Reader decode cache set: compiled struct plans
@@ -337,8 +340,10 @@ func codecUnmarshal(data []byte, v any) (err error) {
 		}
 	}()
 	d = newBudgetDecoder(wire.NewReader(data), effLimits(Limits{}), newBasicReg(), nil, nil, nil, nil, nil, nil)
-	if _, _, err := d.r.ReadHeader(); err != nil {
+	if _, minor, err := d.r.ReadHeader(); err != nil {
 		return d.mapErr(err)
+	} else {
+		d.legacy = minor == 0
 	}
 	desc, err := d.r.ReadDesc()
 	if err != nil {
@@ -348,6 +353,7 @@ func codecUnmarshal(data []byte, v any) (err error) {
 	if err != nil {
 		return err
 	}
+	d.noteGrainUniverse(target.Type())
 	if rootDerefApplies(pd, target) {
 		return d.decodeRootPointer(pd, target, func(f func()) { rootRestore = f })
 	}
@@ -481,9 +487,20 @@ func (d *codecDecoder) decodeRootPointer(pd *wire.Desc, target reflect.Value, se
 				target.Set(rv.Elem())
 				return nil
 			}
-			if refOpensPointee(pd, sort) {
-				return d.decodeRootPointerBody(pd, target, setRestore)
+			if _, err := d.r.ReadRef(); err != nil {
+				return d.mapErr(err)
 			}
+			if sort == wire.RecordDesc {
+				gd, err := d.r.DescAt(id)
+				if err != nil {
+					return d.mapErr(err)
+				}
+				return d.decodeGrainOpening(gd, target, pathNode{idx: -1})
+			}
+			if sort == wire.RecordValue && rv.IsValid() {
+				return d.materializeGrain(rv, target, pathNode{idx: -1})
+			}
+			return d.fail(errFormat(classBadRef, d.r.Pos(), "", nil, nil, errDetail(fmt.Sprintf("root ref %d is not an object record", id))))
 		}
 		id, err := d.r.ReadRef()
 		if err != nil {
@@ -498,6 +515,24 @@ func (d *codecDecoder) decodeRootPointer(pd *wire.Desc, target reflect.Value, se
 		}
 		target.Set(pv.Elem())
 		return nil
+	case wire.ClassDesc:
+		// a DESC at the root is the grain tag of a differing-grain
+		// opening, unless the root's pointee is an interface (its
+		// dynamic-type literal is the body)
+		pointeeIface := target.Kind() == reflect.Interface
+		if target.Kind() == reflect.Pointer {
+			pointeeIface = target.Type().Elem().Kind() == reflect.Interface
+		} else if p0, _, ok := derefNamed(pd); ok && p0.Kind == wire.KindPointer && len(p0.Refs) > 0 {
+			pointeeIface = p0.Refs[0].Kind == wire.KindInterface
+		}
+		if !pointeeIface {
+			gd, err := d.r.ReadDesc()
+			if err != nil {
+				return d.mapErr(err)
+			}
+			return d.decodeGrainOpening(gd, target, pathNode{idx: -1})
+		}
+		return d.decodeRootPointerBody(pd, target, setRestore)
 	default:
 		return d.decodeRootPointerBody(pd, target, setRestore)
 	}
@@ -564,6 +599,7 @@ func (d *codecDecoder) decodeSub(v any) error {
 		d.broken = d.mapErr(err)
 		return d.broken
 	}
+	d.noteGrainUniverse(target.Type())
 	if err := matchRootDesc(cd, target.Type(), d.naming()); err != nil {
 		gapped, gerr := d.decodeRootGap(cd, target, d.naming())
 		if gapped {
@@ -588,6 +624,7 @@ func (d *codecDecoder) decodeSub(v any) error {
 type codecStreamDecoder struct {
 	r       *wire.Reader
 	started bool
+	minor   uint8
 	// sawValue records that at least one value has been decoded: the
 	// header is written with the first value (lazy encode), so input
 	// ending right after the header was truncated before any value —
@@ -625,8 +662,10 @@ func (d *codecStreamDecoder) init(src io.Reader) error {
 	if d.shr == nil {
 		d.shr = &decShared{}
 	}
-	if _, _, err := d.r.ReadHeader(); err != nil {
+	if _, minor, err := d.r.ReadHeader(); err != nil {
 		return d.mapErrInit(err)
+	} else {
+		d.minor = minor
 	}
 	return nil
 }
@@ -674,6 +713,7 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 		}
 	}()
 	dec = newBudgetDecoder(d.r, eff, d.reg, d.coders, d.binds, d.fac, d.shared, d.asName, d.shr)
+	dec.legacy = d.minor == 0
 	desc, err := d.r.ReadDesc()
 	if err != nil {
 		d.broken = dec.mapErr(err)
@@ -1022,6 +1062,16 @@ func (d *codecDecoder) resolveIface(desc *wire.Desc, target reflect.Value, p pat
 // resolveConcrete materializes a concrete dynamic value behind an already
 // read tag cd (the root position hands the tag in directly).
 func (d *codecDecoder) resolveConcrete(cd *wire.Desc, target reflect.Value, p pathNode) error {
+	if os.Getenv("GBON_TRACE") != "" {
+		_, hit := d.reg[cd.Name]
+		var rgx []string
+		for k := range d.reg {
+			if len(k) > 24 {
+				rgx = append(rgx, k)
+			}
+		}
+		fmt.Printf("TRACE resolveConcrete name=%q reg=%v long-keys=%v\n", cd.Name, hit, rgx)
+	}
 	if d.reg == nil {
 		return d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail("interface concrete type needs a type registry: use Decoder.Register")))
 	}
@@ -1048,6 +1098,23 @@ func (d *codecDecoder) resolveConcrete(cd *wire.Desc, target reflect.Value, p pa
 // unknown_name reject.
 func (d *codecDecoder) resolveDerived(cd *wire.Desc, target reflect.Value, p pathNode) error {
 	dt, ok := deriveIfacePtrChain(cd.Name)
+	if !ok {
+		// the derivation boundary: chains compose over named bases
+		// reached through the pool or a registered pointer entry — a
+		// directly registered bare name does not carry its pointer
+		// forms (the incomplete-registry contract)
+		dt, ok = deriveNamedChain(cd.Name, func(n string) (reflect.Type, bool) {
+			if rt, ok := d.grainNames[n]; ok && rt.Name() != "" {
+				return rt, true
+			}
+			for _, source := range []map[string]reflect.Type{d.reg, d.grainNames} {
+				if rt, ok := source["*"+n]; ok && rt.Kind() == reflect.Pointer && rt.Elem().Name() != "" {
+					return rt.Elem(), true
+				}
+			}
+			return nil, false
+		})
+	}
 	if !ok {
 		return errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail("interface concrete type not registered: use Decoder.Register"))
 	}
@@ -2261,12 +2328,53 @@ func (d *codecDecoder) skipValue(desc *wire.Desc, path string) error {
 		}
 		switch class {
 		case wire.ClassNil:
-			if _, err := d.r.ReadNil(); err != nil {
+			if _, err := d.r.ReadNilSelector(); err != nil {
 				return d.mapErr(err)
 			}
 			return nil
 		case wire.ClassRef:
-			return d.skipPointerRef(desc, path)
+			// a naked REF consumes the token only; a grain-tag REF
+			// skips the tag and the record body at the tag's grain
+			// (the placeholder keeps the id space aligned for cycle
+			// REFs inside the skipped body)
+			if id, ok := d.r.PeekRef(); ok {
+				sort, _ := d.r.RecordAt(id)
+				if _, err := d.r.ReadRef(); err != nil {
+					return d.mapErr(err)
+				}
+				if sort == wire.RecordDesc {
+					gd, err := d.r.DescAt(id)
+					if err != nil {
+						return d.mapErr(err)
+					}
+					if !descZeroSize(gd, 0) {
+						d.r.RegisterValue(reflect.Value{})
+					}
+					return d.skipValue(gd, path)
+				}
+				return nil
+			}
+			if _, err := d.r.ReadRef(); err != nil {
+				return d.mapErr(err)
+			}
+			return nil
+		case wire.ClassDesc:
+			if pd, _, ok := derefNamed(desc.Refs[0]); ok && pd.Kind == wire.KindInterface {
+				if !descZeroSize(desc.Refs[0], 0) {
+					d.r.RegisterValue(reflect.Value{})
+				}
+				return d.skipValue(desc.Refs[0], path)
+			}
+			// a DESC-literal grain tag skips the literal and the body
+			// at the tag's grain
+			gd, err := d.r.ReadDesc()
+			if err != nil {
+				return d.mapErr(err)
+			}
+			if !descZeroSize(gd, 0) {
+				d.r.RegisterValue(reflect.Value{})
+			}
+			return d.skipValue(gd, path)
 		default:
 			// placeholder object record: keeps the id space aligned so
 			// cycle REFs inside the skipped body resolve;
@@ -2345,82 +2453,6 @@ func (d *codecDecoder) skipStringToken(path string) error {
 	return d.checkBytesStr(path)
 }
 
-// skipPointerRef skips a pointer body opening with a REF: whole-value
-// backrefs consume one token; otherwise the REF opens the pointee body
-// behind a silent cell reservation.
-func (d *codecDecoder) skipPointerRef(desc *wire.Desc, path string) error {
-	id, ok := d.r.PeekRef()
-	if !ok {
-		if _, err := d.r.ReadRef(); err != nil {
-			return d.mapErr(err)
-		}
-		return nil
-	}
-	sort, rv := d.r.RecordAt(id)
-	pd, _, pok := derefNamed(desc.Refs[0])
-	if pok {
-		if dp, ok := descPtrDepth(desc); ok && sort == wire.RecordValue && rv.IsValid() && ptrDepth(rv.Type()) == dp {
-			if _, err := d.r.ReadRef(); err != nil {
-				return d.mapErr(err)
-			}
-			return nil
-		}
-		if (sort == wire.RecordDesc && pd.Kind == wire.KindInterface) ||
-			(sort == wire.RecordValue && pd.Kind == wire.KindPointer) {
-			if !descZeroSize(desc.Refs[0], 0) {
-				d.r.RegisterValue(reflect.Value{})
-			}
-			return d.skipValue(pd, path)
-		}
-		if sort == wire.RecordMap && pd.Kind == wire.KindMap {
-			if !descZeroSize(desc.Refs[0], 0) {
-				d.r.RegisterValue(reflect.Value{})
-			}
-			if _, err := d.r.ReadRef(); err != nil {
-				return d.mapErr(err)
-			}
-			return nil
-		}
-	}
-	if _, err := d.r.ReadRef(); err != nil {
-		return d.mapErr(err)
-	}
-	return nil
-}
-
-// ptrDepth counts the leading pointer levels of a Go type.
-func ptrDepth(t reflect.Type) int {
-	n := 0
-	for t.Kind() == reflect.Pointer {
-		n++
-		t = t.Elem()
-	}
-	return n
-}
-
-// descPtrDepth counts the pointer levels of a descriptor chain; false on
-// a degenerate NAMED or pointer cycle.
-func descPtrDepth(desc *wire.Desc) (int, bool) {
-	n := 0
-	seen := make(map[*wire.Desc]bool)
-	d := desc
-	for {
-		nd, _, ok := derefNamed(d)
-		if !ok {
-			return 0, false
-		}
-		if nd.Kind != wire.KindPointer {
-			return n, true
-		}
-		if seen[nd] {
-			return 0, false
-		}
-		seen[nd] = true
-		n++
-		d = nd.Refs[0]
-	}
-}
-
 // chargeValueBody applies the per-body budget steps: subtree depth
 // (paired with the returned restore), the cumulative node count, and
 // the byte-window check.
@@ -2437,187 +2469,211 @@ func (d *codecDecoder) chargeValueBody(p pathNode) (restore func(), err error) {
 	return restore, d.checkBytes(p)
 }
 
-// decodePointer reconstructs a pointer cell: the wire body carries the
-// pointee's tokens and the cell is silent; a leading REF or nil selector
-// is the pointee's unless it names a value cell of the slot's own type.
+// decodePointer reconstructs a pointer position through the uniform
+// grain resolver: the nil selector or the zero-size marker, a naked REF
+// to an open record, a grain-tagged opening (REF or DESC literal naming
+// the record grain when it differs from the position's static pointee
+// type), or the body directly at the equal grain. Every REF resolves
+// through materializeGrain — sort, record grain, descent — the single
+// grain-resolution path.
 func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pathNode) error {
 	class, err := d.r.PeekClass()
 	if err != nil {
 		return d.mapErr(err)
 	}
+	elem := target.Type().Elem()
 	switch class {
 	case wire.ClassNil:
-		if k, ok := d.r.PeekNilKind(); ok && k == wire.NilPointer {
+		k, ok := d.r.PeekNilKind()
+		if !ok {
+			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail("unknown nil selector in pointer position")))
+		}
+		if k == wire.NilPointer {
+			// a nil position and a nil-bodied pointer chain share the
+			// bytes; the position reads nil (nil-merge degeneracy)
 			if _, err := d.r.ReadNil(); err != nil {
 				return d.mapErr(err)
 			}
 			target.Set(reflect.Zero(target.Type()))
 			return nil
 		}
-		return d.decodePointerCell(desc, target, p)
-	case wire.ClassRef:
-		handled, err := d.pointerBackref(desc, target, p)
-		if handled || err != nil {
+		if k == wire.NilZeroSize {
+			if _, err := d.r.ReadNilSelector(); err != nil {
+				return d.mapErr(err)
+			}
+			target.Set(reflect.New(elem))
+			return nil
+		}
+		// a nil selector of the pointee's own class (interface, slice,
+		// map): the cell materializes and the pointee body consumes the
+		// token
+		cell := reflect.New(elem)
+		if elem.Size() != 0 {
+			d.r.RegisterValue(cell)
+		}
+		if err := d.decodeBody(desc.Refs[0], cell.Elem(), p); err != nil {
 			return err
 		}
-		return d.decodePointerCell(desc, target, p)
-	default:
-		return d.decodePointerCell(desc, target, p)
-	}
-}
-
-// pointerBackref consumes a whole-value REF to a value cell of the
-// slot's own pointer type; false means the REF opens the pointee body
-// (fresh cell) or the record is incompatible (loud family below).
-func (d *codecDecoder) pointerBackref(desc *wire.Desc, target reflect.Value, p pathNode) (bool, error) {
-	id, ok := d.r.PeekRef()
-	if !ok {
-		return false, nil
-	}
-	sort, rv := d.r.RecordAt(id)
-	if sort == wire.RecordValue && rv.IsValid() && rv.Type() == target.Type() {
-		if _, err := d.r.ReadRef(); err != nil {
-			return false, d.mapErr(err)
+		target.Set(cell)
+		return nil
+	case wire.ClassRef:
+		id, ok := d.r.PeekRef()
+		if !ok {
+			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail("malformed ref token in pointer position")))
 		}
-		target.Set(rv)
-		return true, nil
-	}
-	if sort == wire.RecordValue && rv.IsValid() && rv.Type() != target.Type() {
-		// a value cell of exactly the pointee's type names the pointee:
-		// the wrapper cell materializes and the inner decode resolves
-		// this REF as the pointee's whole-value backref
-		if rv.Type() == target.Type().Elem() {
-			return false, nil
-		}
-		if av, ok := interiorOffsetZero(rv, target.Type()); ok {
+		sort, rv := d.r.RecordAt(id)
+		if sort == wire.RecordDesc && d.grainTagAt(id, elem) {
 			if _, err := d.r.ReadRef(); err != nil {
-				return false, d.mapErr(err)
+				return d.mapErr(err)
 			}
-			target.Set(av)
-			return true, nil
+			gd, err := d.r.DescAt(id)
+			if err != nil {
+				return d.mapErr(err)
+			}
+			return d.decodeGrainOpening(gd, target, p)
+		}
+		if sort == wire.RecordOther {
+			return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not an object record", id))))
+		}
+		// a naked REF to an open record of a compatible grain
+		if sort == wire.RecordValue && rv.IsValid() && !rv.IsNil() && grainCompatible(rv.Elem().Type(), elem) {
+			if _, err := d.r.ReadRef(); err != nil {
+				return d.mapErr(err)
+			}
+			return d.materializeGrain(rv, target, p)
+		}
+		// every other REF shape (a container/string record, an
+		// incompatible value record) is the unconsumed body of this
+		// address's elided opening
+	default:
+		if d.legacy && class == wire.ClassDesc && elem.Kind() == reflect.Interface {
+			// 0.0 compat: an interface slot opening whose leading
+			// descriptor names a registered pointer type over a struct
+			// whose leading field carries the slot — the record opens
+			// at the container grain and the payload resolves against
+			// the field
+			if _, name, ok := d.r.PeekDesc(); ok {
+				if T, fits := d.legacyContainerGrain(name, elem); fits {
+					cell := reflect.New(T)
+					if T.Size() != 0 {
+						d.r.RegisterValue(cell)
+					}
+					gd, err := d.r.ReadDesc()
+					if err != nil {
+						return d.mapErr(err)
+					}
+					slot := cell.Elem().Field(0)
+					if err := d.resolveConcrete(gd, slot, p); err != nil {
+						return err
+					}
+					target.Set(slot.Addr())
+					return nil
+				}
+			}
+		}
+		if class == wire.ClassDesc && elem.Kind() == reflect.Interface && !d.grainTagPeek(elem) {
+			// the interface slot's own dynamic-type literal: the record
+			// cell registers before the literal's ids (the encoder
+			// reserves before the body)
+			cell := reflect.New(elem)
+			if elem.Size() != 0 {
+				d.r.RegisterValue(cell)
+			}
+			gd, err := d.r.ReadDesc()
+			if err != nil {
+				return d.mapErr(err)
+			}
+			if err := d.resolveConcrete(gd, cell.Elem(), p); err != nil {
+				return err
+			}
+			target.Set(cell)
+			return nil
+		}
+		if class == wire.ClassDesc && (d.grainTagPeek(elem) || !ifaceChain(elem)) {
+			gd, err := d.r.ReadDesc()
+			if err != nil {
+				return d.mapErr(err)
+			}
+			return d.decodeGrainOpening(gd, target, p)
 		}
 	}
-	if refOpensPointee(desc, sort) {
-		return false, nil
+	// equal-grain opening: the body follows directly at the position's
+	// static pointee grain (interface pointees read their dynamic-type
+	// token here)
+	cell := reflect.New(elem)
+	if elem.Size() != 0 {
+		d.r.RegisterValue(cell)
 	}
-	if _, err := d.r.ReadRef(); err != nil {
-		return false, d.mapErr(err)
+	if err := d.decodeBody(desc.Refs[0], cell.Elem(), p); err != nil {
+		return err
 	}
-	pv, err := d.r.ValueAt(id)
-	if err != nil {
-		return false, d.mapErr(err)
-	}
-	if !pv.IsValid() || pv.Type() != target.Type() {
-		return false, d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not a %s target", id, target.Type()))))
-	}
-	target.Set(pv)
-	return true, nil
+	target.Set(cell)
+	return nil
 }
 
-// refOpensPointee reports whether a REF of this record sort can open
-// the pointee body: iface points and pointer chains open with a
-// descriptor ref, maps with a map ref, plain pointers with a value cell.
-func refOpensPointee(desc *wire.Desc, sort wire.RecordKind) bool {
-	pd, _, ok := derefNamed(desc.Refs[0])
-	if !ok {
+// grainTagAt reports whether a REF to descriptor id at a pointer
+// position of static pointee elem is the grain tag of a differing-grain
+// opening: the tagged grain must carry the position's grain (derivability
+// or the named-conversion collapse). Interface pointee payloads name
+// their dynamic type through the same REF shape and never qualify.
+func (d *codecDecoder) grainTagAt(id uint64, elem reflect.Type) bool {
+	if d.legacy {
 		return false
 	}
-	switch pd.Kind {
-	case wire.KindInterface:
-		return sort == wire.RecordDesc
-	case wire.KindPointer:
-		return sort == wire.RecordValue || sort == wire.RecordDesc
-	case wire.KindMap:
-		return sort == wire.RecordMap
-	case wire.KindString:
-		return sort == wire.RecordString
-	}
-	return false
-}
-
-// interiorOffsetZero resolves a REF whose storage the encoder interned
-// by address: a pointer to a struct's first field shares the cell
-// address, so the slot denotes the offset-zero l-value's address.
-func interiorOffsetZero(rv reflect.Value, t reflect.Type) (reflect.Value, bool) {
-	if rv.Kind() != reflect.Pointer || t.Kind() != reflect.Pointer {
-		return reflect.Value{}, false
-	}
-	st := rv.Type().Elem()
-	v := rv.Elem()
-	for st.Kind() == reflect.Struct && v.Kind() == reflect.Struct {
-		if st.NumField() == 0 {
-			return reflect.Value{}, false
-		}
-		if st.Field(0).Name == "_" {
-			return reflect.Value{}, false
-		}
-		f := v.Field(0)
-		if f.Type() == t.Elem() {
-			if !f.CanAddr() {
-				return reflect.Value{}, false
-			}
-			return f.Addr(), true
-		}
-		st, v = f.Type(), f
-	}
-	return reflect.Value{}, false
-}
-
-// decodePointerCell materializes a fresh cell registered before its
-// pointee decodes (two-phase; cycles close through the id); zero-size
-// targets mirror the encoder and reserve nothing.
-func (d *codecDecoder) decodePointerCell(desc *wire.Desc, target reflect.Value, p pathNode) error {
-	if elem := target.Type().Elem(); elem.Kind() == reflect.Interface && desc.Refs[0].Kind == wire.KindInterface {
-		if k, name, ok := d.r.PeekDesc(); ok && k == wire.KindPointer {
-			if T, fits := slotGrainContainer(elem, name, d.reg); fits {
-				return d.decodeContainerGrainCell(T, p, target)
-			}
-		}
-	}
-	pv := reflect.New(target.Type().Elem())
-	if target.Type().Elem().Size() != 0 {
-		d.r.RegisterValue(pv)
-	}
-	if err := d.decodeBody(desc.Refs[0], pv.Elem(), p); err != nil {
-		return err
-	}
-	target.Set(pv)
-	return nil
-}
-
-// decodeContainerGrainCell opens a slot record at the container grain:
-// the cell registers as *T before the content tag is read, the content
-// decodes into the leading field, and the served slot is its address.
-func (d *codecDecoder) decodeContainerGrainCell(T reflect.Type, p pathNode, target reflect.Value) error {
-	pv := reflect.New(T)
-	if T.Size() != 0 {
-		d.r.RegisterValue(pv)
-	}
-	restore, err := d.chargeValueBody(p)
-	defer restore()
+	gd, err := d.r.DescAt(id)
 	if err != nil {
-		return err
+		return false
 	}
-	cd, err := d.r.ReadDesc()
+	gt, err := d.grainTypeOf(gd, pathNode{idx: -1}, 0)
 	if err != nil {
-		return d.mapErr(err)
+		return false
 	}
-	slot := pv.Elem().Field(0)
-	if err := d.resolveConcrete(cd, slot, p); err != nil {
-		return err
+	if gt == elem || gt == normalizeGrain(elem) {
+		// the pointer-grain self-tag is the clause-2a exemption from
+		// the tag-name-inequality rule
+		if gt.Kind() != reflect.Pointer {
+			return false
+		}
 	}
-	target.Set(slot.Addr())
-	return nil
+	return grainCompatible(gt, elem)
 }
 
-// slotGrainContainer resolves the container grain of a slot-record
-// opening from the peeked content tag: the tag names *T in the type
-// registry for a struct T whose leading field carries the slot element.
-func slotGrainContainer(elem reflect.Type, name string, reg map[string]reflect.Type) (reflect.Type, bool) {
-	if reg == nil || name == "" {
+// ifaceChain reports whether t is an interface or a pointer chain into
+// one: such positions open bodies whose leading descriptor is the
+// interface payload's dynamic type.
+func ifaceChain(t reflect.Type) bool {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Interface
+}
+
+// lookupGrainType resolves a wire name to a type through the registry
+// and the target-tree pool; a bare-name miss derives through a
+// registered pointer entry (registering *T implies T).
+func (d *codecDecoder) lookupGrainType(n string) (reflect.Type, bool) {
+	if rt, ok := d.reg[n]; ok {
+		return rt, true
+	}
+	if rt, ok := d.grainNames[n]; ok {
+		return rt, true
+	}
+	for _, source := range []map[string]reflect.Type{d.reg, d.grainNames} {
+		if rt, ok := source["*"+n]; ok && rt.Kind() == reflect.Pointer {
+			return rt.Elem(), true
+		}
+	}
+	return nil, false
+}
+
+// legacyContainerGrain resolves the 0.0 container-grain reading: the
+// peeked pointer descriptor names a registry type over a struct whose
+// leading field carries the slot element.
+func (d *codecDecoder) legacyContainerGrain(name string, elem reflect.Type) (reflect.Type, bool) {
+	if name == "" {
 		return nil, false
 	}
-	rt, ok := reg[name]
+	rt, ok := d.lookupGrainType(name)
 	if !ok || rt.Kind() != reflect.Pointer {
 		return nil, false
 	}
@@ -2629,4 +2685,328 @@ func slotGrainContainer(elem reflect.Type, name string, reg map[string]reflect.T
 		return nil, false
 	}
 	return T, true
+}
+
+// grainTagPeek reports whether the DESC literal at the current position
+// is the grain tag of a differing-grain opening: a name resolving to a
+// type that carries the position's grain. Interface payloads name their
+// dynamic type through the same token and never qualify.
+func (d *codecDecoder) grainTagPeek(elem reflect.Type) bool {
+	if d.legacy {
+		return false
+	}
+	_, name, ok := d.r.PeekDesc()
+	if !ok || name == "" {
+		return false
+	}
+	var gt reflect.Type
+	if rt, ok := d.lookupGrainType(name); ok {
+		gt = rt
+	} else if dt, ok := deriveIfacePtrChain(name); ok {
+		gt = dt
+	} else if dt, ok := deriveNamedChain(name, d.lookupGrainType); ok {
+		gt = dt
+	} else {
+		return false
+	}
+	if gt == elem || gt == normalizeGrain(elem) {
+		// the pointer-grain self-tag is the clause-2a exemption from
+		// the tag-name-inequality rule
+		if gt.Kind() != reflect.Pointer {
+			return false
+		}
+	}
+	return grainCompatible(gt, elem)
+}
+
+// decodeGrainOpening materializes a grain-tagged opening: the record
+// decodes at the tag's grain into a fresh cell (registered before its
+// body, so cycle REFs close mid-body), then the position materializes
+// through the uniform resolver.
+func (d *codecDecoder) decodeGrainOpening(gd *wire.Desc, target reflect.Value, p pathNode) error {
+	gt, err := d.grainTypeOf(gd, p, 0)
+	if err != nil {
+		return err
+	}
+	cell := reflect.New(gt)
+	if gt.Size() != 0 {
+		d.r.RegisterValue(cell)
+	}
+	if err := d.decodeBody(gd, cell.Elem(), p); err != nil {
+		return err
+	}
+	if target.Kind() != reflect.Pointer {
+		if sv, ok := descendGrainValue(cell.Elem(), target.Type()); ok {
+			target.Set(sv)
+			return nil
+		}
+		return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), cell.Elem().Type(), target.Type(), errDetail("record grain does not derive the position grain")))
+	}
+	return d.materializeGrain(cell, target, p)
+}
+
+// materializeGrain resolves a pointer position against a record: the
+// record's cell rv (a pointer at the grain) materializes into target
+// through type assignability or offset-0 descent; an underivable grain
+// is a format error.
+func (d *codecDecoder) materializeGrain(rv reflect.Value, target reflect.Value, p pathNode) error {
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail("record cell is not a live pointer")))
+	}
+	if target.Kind() == reflect.Pointer {
+		av, ok := descendGrain(rv.Elem(), target.Type().Elem())
+		if !ok {
+			return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), rv.Elem().Type(), target.Type().Elem(), errDetail("record grain does not derive the position grain")))
+		}
+		target.Set(av)
+		return nil
+	}
+	sv, ok := descendGrainValue(rv.Elem(), target.Type())
+	if !ok {
+		return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), rv.Elem().Type(), target.Type(), errDetail("record grain does not derive the position grain")))
+	}
+	target.Set(sv)
+	return nil
+}
+
+// descendGrainValue walks offset-0 struct fields and array element 0
+// from the grain value toward a value position of the wanted type.
+func descendGrainValue(grainVal reflect.Value, want reflect.Type) (reflect.Value, bool) {
+	if t := grainVal.Type(); t.AssignableTo(want) {
+		return grainVal, true
+	} else if t.ConvertibleTo(want) {
+		return grainVal.Convert(want), true
+	}
+	switch grainVal.Kind() {
+	case reflect.Struct:
+		t := grainVal.Type()
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.Name == "_" || f.Offset != 0 {
+				continue
+			}
+			if sv, ok := descendGrainValue(grainVal.Field(i), want); ok {
+				return sv, true
+			}
+		}
+	case reflect.Array:
+		if grainVal.Len() > 0 {
+			if sv, ok := descendGrainValue(grainVal.Index(0), want); ok {
+				return sv, true
+			}
+		}
+	}
+	return reflect.Value{}, false
+}
+
+// descendGrain walks offset-0 struct fields (blank excluded) and array
+// element 0 from the grain value toward the position's pointee type,
+// returning the address of the matching sub-value; pointer
+// assignability covers named conversions of identical underlying
+// layout.
+func descendGrain(grainVal reflect.Value, want reflect.Type) (reflect.Value, bool) {
+	if pt := reflect.PointerTo(grainVal.Type()); pt.AssignableTo(reflect.PointerTo(want)) {
+		return grainVal.Addr(), true
+	} else if pt.ConvertibleTo(reflect.PointerTo(want)) {
+		return grainVal.Addr().Convert(reflect.PointerTo(want)), true
+	}
+	switch grainVal.Kind() {
+	case reflect.Struct:
+		t := grainVal.Type()
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.Name == "_" || f.Offset != 0 {
+				continue
+			}
+			fv := grainVal.Field(i)
+			if !fv.CanAddr() {
+				continue
+			}
+			if av, ok := descendGrain(fv, want); ok {
+				return av, true
+			}
+		}
+	case reflect.Array:
+		if grainVal.Len() > 0 {
+			ev := grainVal.Index(0)
+			if ev.CanAddr() {
+				if av, ok := descendGrain(ev, want); ok {
+					return av, true
+				}
+			}
+		}
+	}
+	return reflect.Value{}, false
+}
+
+// grainTypeOf materializes the reflect.Type of a grain tag descriptor:
+// registered names resolve through the registry, derivable names
+// through their derivation, a NAMED miss through its underlying
+// descriptor, and everything else builds structurally from the layout
+// (the structural clone is layout-identical to the encoded grain;
+// positions materialize through assignability).
+func (d *codecDecoder) grainTypeOf(gd *wire.Desc, p pathNode, depth int) (reflect.Type, error) {
+	if depth > d.maxDepth {
+		return nil, d.fail(errBudget(classBudgetDepth, d.r.Pos(), p.String(), nil, d.maxDepth, errDetail(fmt.Sprintf("grain tag nesting exceeds depth budget MaxDepth=%d", d.maxDepth))))
+	}
+	if gd.Name != "" {
+		if rt, ok := d.reg[gd.Name]; ok {
+			return rt, nil
+		}
+		if rt, ok := d.grainNames[gd.Name]; ok {
+			return rt, nil
+		}
+		if dt, ok := deriveIfacePtrChain(gd.Name); ok {
+			return dt, nil
+		}
+	}
+	if gd.Kind == wire.KindNamed {
+		if len(gd.Refs) == 0 {
+			return nil, d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), gd.Name, nil, errDetail("grain type not registered: use Decoder.Register")))
+		}
+		return d.grainTypeOf(gd.Refs[0], p, depth+1)
+	}
+	return d.descToType(gd, p, depth)
+}
+
+// collectNamedTypes gathers the named types of t's static tree under
+// their qualified wire names: grain tags resolve against the decoded
+// target's own universe first.
+func collectNamedTypes(t reflect.Type, pool map[string]reflect.Type, seen map[reflect.Type]bool) {
+	if t == nil || seen[t] {
+		return
+	}
+	seen[t] = true
+	pool[t.String()] = t
+	if t.Name() != "" {
+		pool[qualifiedName(t)] = t
+		if ng := normalizeGrain(t); ng != t {
+			pool[ng.String()] = ng
+		}
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		for i := 0; i < t.NumField(); i++ {
+			collectNamedTypes(t.Field(i).Type, pool, seen)
+		}
+	case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Chan:
+		collectNamedTypes(t.Elem(), pool, seen)
+	case reflect.Map:
+		collectNamedTypes(t.Key(), pool, seen)
+		collectNamedTypes(t.Elem(), pool, seen)
+	}
+}
+
+// noteGrainUniverse extends the grain-name pool with the target's type
+// tree.
+func (d *codecDecoder) noteGrainUniverse(t reflect.Type) {
+	if d.grainNames == nil {
+		d.grainNames = make(map[string]reflect.Type, 8)
+	}
+	collectNamedTypes(t, d.grainNames, make(map[reflect.Type]bool))
+}
+
+// descToType builds a structural type from a descriptor layout.
+func (d *codecDecoder) descToType(gd *wire.Desc, p pathNode, depth int) (reflect.Type, error) {
+	if depth > d.maxDepth {
+		return nil, d.fail(errBudget(classBudgetDepth, d.r.Pos(), p.String(), nil, d.maxDepth, errDetail(fmt.Sprintf("grain tag nesting exceeds depth budget MaxDepth=%d", d.maxDepth))))
+	}
+	one := func() (reflect.Type, error) {
+		if len(gd.Refs) == 0 {
+			return nil, d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), gd.Name, nil, errDetail("descriptor misses its ref")))
+		}
+		return d.grainTypeOf(gd.Refs[0], p, depth+1)
+	}
+	switch gd.Kind {
+	case wire.KindStruct:
+		fs := make([]reflect.StructField, 0, len(gd.Fields))
+		for i := range gd.Fields {
+			ft, err := d.grainTypeOf(gd.Fields[i].Type, p, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			fs = append(fs, reflect.StructField{Name: gd.Fields[i].Name, Type: ft})
+		}
+		return reflect.StructOf(fs), nil
+	case wire.KindPointer:
+		t, err := one()
+		if err != nil {
+			return nil, err
+		}
+		return reflect.PointerTo(t), nil
+	case wire.KindSlice:
+		t, err := one()
+		if err != nil {
+			return nil, err
+		}
+		return reflect.SliceOf(t), nil
+	case wire.KindArray:
+		t, err := one()
+		if err != nil {
+			return nil, err
+		}
+		return reflect.ArrayOf(int(gd.Len), t), nil
+	case wire.KindMap:
+		if len(gd.Refs) < 2 {
+			return nil, d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), gd.Name, nil, errDetail("map descriptor misses its refs")))
+		}
+		kt, err := d.grainTypeOf(gd.Refs[0], p, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		vt, err := d.grainTypeOf(gd.Refs[1], p, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		return reflect.MapOf(kt, vt), nil
+	case wire.KindString:
+		return reflect.TypeFor[string](), nil
+	case wire.KindBlob:
+		return reflect.TypeFor[[]byte](), nil
+	case wire.KindBool:
+		return reflect.TypeFor[bool](), nil
+	case wire.KindInt, wire.KindUint:
+		var t reflect.Type
+		switch gd.Width {
+		case 1:
+			t = reflect.TypeFor[int8]()
+		case 2:
+			t = reflect.TypeFor[int16]()
+		case 4:
+			t = reflect.TypeFor[int32]()
+		case 8:
+			t = reflect.TypeFor[int64]()
+		default:
+			t = reflect.TypeFor[int]()
+		}
+		if gd.Kind == wire.KindUint {
+			switch gd.Width {
+			case 1:
+				t = reflect.TypeFor[uint8]()
+			case 2:
+				t = reflect.TypeFor[uint16]()
+			case 4:
+				t = reflect.TypeFor[uint32]()
+			case 8:
+				t = reflect.TypeFor[uint64]()
+			default:
+				t = reflect.TypeFor[uint]()
+			}
+		}
+		return t, nil
+	case wire.KindFloat:
+		if gd.Width == 4 {
+			return reflect.TypeFor[float32](), nil
+		}
+		return reflect.TypeFor[float64](), nil
+	case wire.KindComplex:
+		if gd.Width == 8 {
+			return reflect.TypeFor[complex64](), nil
+		}
+		return reflect.TypeFor[complex128](), nil
+	case wire.KindInterface:
+		return reflect.TypeFor[any](), nil
+	default:
+		return nil, d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), gd.Name, nil, errDetail("descriptor kind is not a grain")))
+	}
 }

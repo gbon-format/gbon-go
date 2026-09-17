@@ -96,6 +96,33 @@ func deriveIfacePtrChain(name string) (reflect.Type, bool) {
 	return t, true
 }
 
+// deriveNamedChain reconstructs a type from its wire name: slice and
+// map[string] wrappers and leading pointer stars compose over a base
+// resolved through the caller's lookup (registry or grain pool).
+func deriveNamedChain(name string, resolve func(string) (reflect.Type, bool)) (reflect.Type, bool) {
+	if t, ok := resolve(name); ok {
+		return t, true
+	}
+	if rest, ok := strings.CutPrefix(name, "[]"); ok {
+		if t, ok := deriveNamedChain(rest, resolve); ok {
+			return reflect.SliceOf(t), true
+		}
+		return nil, false
+	}
+	if rest, ok := strings.CutPrefix(name, "map[string]"); ok {
+		if t, ok := deriveNamedChain(rest, resolve); ok {
+			return reflect.MapOf(reflect.TypeFor[string](), t), true
+		}
+		return nil, false
+	}
+	if rest, ok := strings.CutPrefix(name, "*"); ok {
+		if t, ok := deriveNamedChain(rest, resolve); ok {
+			return reflect.PointerTo(t), true
+		}
+	}
+	return nil, false
+}
+
 // qualifiedName is the name of a defined type outside the standard
 // library: import path + "." + the short t.String() form. Standard
 // library and main packages keep the short form (wire-byte stability for

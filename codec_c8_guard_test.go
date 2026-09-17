@@ -47,8 +47,8 @@ func TestC8PureScanNoMachinery(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("pure scan allocations: got %v, want 0", allocs)
 	}
-	if len(e.slotIx) != 0 || len(e.ptrs) != 0 || len(e.maps) != 0 {
-		t.Fatalf("pure scan machinery writes: slots=%d ptrs=%d maps=%d, want 0/0/0", len(e.slotIx), len(e.ptrs), len(e.maps))
+	if len(e.slotIx) != 0 || len(e.grains) != 0 || len(e.maps) != 0 {
+		t.Fatalf("pure scan machinery writes: slots=%d grains=%d maps=%d, want 0/0/0", len(e.slotIx), len(e.grains), len(e.maps))
 	}
 	if e.hdrEp == 0 {
 		t.Fatal("scan epoch not advanced")
