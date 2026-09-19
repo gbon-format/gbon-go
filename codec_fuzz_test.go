@@ -807,6 +807,17 @@ func TestFuzzCorpusCapRejects(t *testing.T) {
 	}
 }
 
+// fuzzTrustedStrip removes the terminal trusted-mode missing-name
+// literal: the sanctioned display channel of the trust flag (class and
+// offset stay flag-independent).
+func fuzzTrustedStrip(s string) string {
+	i := strings.LastIndex(s, " (missing name \"")
+	if i < 0 || !strings.HasSuffix(s, "\")") {
+		return s
+	}
+	return s[:i]
+}
+
 // FuzzTrustedWindow: the trusted-input capture over arbitrary input.
 // Every decode error carrying an offset captures a window within the
 // 32+16 bound, the verbose render carries exactly one marked line at the
@@ -849,7 +860,7 @@ func FuzzTrustedWindow(f *testing.F) {
 		if !errors.As(terr, &tae) || !errors.As(derr, &dae) {
 			t.Fatalf("not As-recoverable: %v", terr)
 		}
-		if tae.Class() != dae.Class() || tae.Offset != dae.Offset || tae.Error() != dae.Error() {
+		if tae.Class() != dae.Class() || tae.Offset != dae.Offset || fuzzTrustedStrip(tae.Error()) != dae.Error() {
 			t.Fatalf("trust flag changed the error: %v vs %v", terr, derr)
 		}
 		if strings.Contains(fmt.Sprintf("%+v", dae), "input =") {

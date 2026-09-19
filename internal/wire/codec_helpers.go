@@ -60,8 +60,9 @@ func (r *Reader) ReadRawBytes(n uint64) ([]byte, error) { return r.readN(n) }
 
 // ByteRange returns the read-only input bytes in [start, end); the bounds
 // come from Pos() snapshots taken around token consumption (skip-path key
-// identity, KO-8).
-func (r *Reader) ByteRange(start, end int) []byte { return r.buf[start:end] }
+// identity, KO-8) and are absolute input offsets, translated here into the
+// sliding window's coordinates.
+func (r *Reader) ByteRange(start, end int) []byte { return r.buf[start-r.base : end-r.base] }
 
 // PeekClass returns the class of the next token without consuming it.
 func (r *Reader) PeekClass() (byte, error) { return r.peekFirst() }

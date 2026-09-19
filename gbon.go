@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"runtime"
 )
 
 // The sentinel errors (ErrFormat, ErrBudget, ErrUnsupported, ErrIO) and
@@ -45,8 +46,10 @@ func Unmarshal(data []byte, v any) error { return codecUnmarshal(data, v) }
 // Limits bounds resource consumption on both sides of the codec. On the
 // decode side it caps input consumption plus derived backing allocations
 // (MaxBytes is one counter: input bytes and charged allocation bytes —
-// slice/blob backings booked as L·elemsize before the allocation happens).
-// On the encode side it caps derived output resources only: MaxDepth is
+// slice/blob backings booked as L·elemsize before the allocation happens),
+// enforced per decoded value: the counter resets when a record begins,
+// and cumulative consumption beyond MaxBytes across the records of a
+// stream is conformant. On the encode side it caps derived output resources only: MaxDepth is
 // recursion frames, MaxNodes output nodes, MaxBytes output bytes;
 // MaxMapPairs and MaxSliceLen do not apply on encode (a live value is not
 // a consumable input resource). The zero value of every field means a
@@ -110,8 +113,23 @@ func isNilSource(v any) bool {
 	return rv.Kind() == reflect.Pointer && rv.IsNil()
 }
 
+// stickyEncodePanic marks an Encoder broken by a mid-Encode panic: the
+// panic is re-raised verbatim by the caller; every subsequent Encode
+// returns this internal_panic error with a dedicated message and a stack.
+func stickyEncodePanic(p any) *Error {
+	stack := make([]byte, panicStackBytes)
+	n := runtime.Stack(stack, false)
+	return &Error{
+		class: classInternalPanic, Offset: -1, Got: p, stack: stack[:n],
+		err: errDetail("encoder broken by a mid-Encode panic; discard the Encoder"),
+	}
+}
+
 // Encode writes one value to the stream. After an error the Encoder is
-// invalid and every subsequent call returns the same error. Calls made from
+// invalid and every subsequent call returns the same error. A panic
+// escaping Encode propagates to the caller unchanged, and the Encoder is
+// broken from that point on: every subsequent call returns the same
+// sticky internal_panic error without writing. Calls made from
 // inside a Coder's EncodeValue append to the stream buffer without
 // flushing; buffered bytes reach w only at the outermost Encode. A wire
 // name reserved through RegisterReserved on this Encoder gates the call
@@ -121,6 +139,14 @@ func isNilSource(v any) bool {
 func (e *Encoder) Encode(v any) error {
 	if e.err != nil {
 		return e.err
+	}
+	if e.enc.inCoder == 0 {
+		defer func() {
+			if p := recover(); p != nil {
+				e.err = stickyEncodePanic(p)
+				panic(p)
+			}
+		}()
 	}
 	// in-coder sub-encodes never flush; internal sub-marshals reuse a
 	// writer-less facade, so the nil-writer gate applies to the outer Encode.
@@ -154,7 +180,11 @@ func (e *Encoder) Encode(v any) error {
 // stream keeps the descriptor intern deterministic), as are a reserved
 // name (platform primitives, time.Time), a nil example, a wire name
 // already bound to a different type, or one type bound to two names;
-// re-binding the same pair is a no-op. RegisterAs does not write to the
+// re-binding the same pair is a no-op. Bindings are chain-scoped: one
+// wire name covers a single pointer chain, a second RegisterAs touching
+// an existing binding's chain under a different name is an
+// ErrUnsupported error, and re-binding the same name at another level
+// of the chain is a no-op. RegisterAs does not write to the
 // stream.
 func (e *Encoder) RegisterAs(wireName string, example any) error {
 	if e.err != nil {
@@ -180,7 +210,15 @@ func (e *Encoder) RegisterAs(wireName string, example any) error {
 		return errRegister(fmt.Sprintf("type %s already encoded in this stream", t))
 	}
 	if prev, ok := e.enc.asType[wireName]; ok && prev != t {
+		if asChainRelated(prev, t) {
+			// a same-name rebind at another chain level: the existing
+			// binding already governs the whole chain
+			return nil
+		}
 		return errRegister(fmt.Sprintf("wire name %q already bound to %s", wireName, prev))
+	}
+	if prev, n, conflict := asChainConflict(t, wireName, e.enc.asName); conflict {
+		return errRegister(fmt.Sprintf("type %s intersects the pointer chain of %s already bound to wire name %q", t, prev, n))
 	}
 	if e.enc.asName == nil {
 		e.enc.asName = make(map[reflect.Type]string)
@@ -426,7 +464,12 @@ func reservedWireName(name string) bool {
 // string, []byte, and the basic composites []any, map[string]any,
 // []string, []int64, map[string]string) come pre-registered, so interface
 // slots holding basic values decode without Register; structured and
-// domain types still need Register or RegisterAs. The type registry is
+// domain types still need Register or RegisterAs. Beyond the seeds the
+// derivable surface covers the unnamed chain grammar over interface
+// points and the registration family — a registration covers its whole
+// pointer chain and a RegisterAs binding bridges the canonical chain
+// names of its levels; every other name keeps the unknown_name reject
+// (the derivable-surface table in docs/bindings/go.md). The type registry is
 // allocated eagerly: types registered after the first Decode are visible
 // to subsequent Decode calls.
 func NewDecoder(r io.Reader) *Decoder {
@@ -477,10 +520,9 @@ func (d *Decoder) Decode(v any) error {
 			return errUnsupported(classContractMismatch, "", nil, nil, errDetail(fmt.Sprintf("reader must be a non-nil value, got %T", d.src)))
 		}
 		sd := &codecStreamDecoder{reg: d.reg, asName: d.asName, coders: d.coders, fac: d}
-		if err := sd.init(d.src); err != nil {
-			d.err = err
-			return err
-		}
+		// The stream header reads inside sd.Decode, under its panic
+		// tripwire; header faults reach this facade as ordinary errors.
+		sd.init(d.src)
 		d.dec = sd
 	}
 	err := d.dec.Decode(v, d.limits)
@@ -612,7 +654,13 @@ func (d *Decoder) invalidateCoderMemo() {
 // not field compatibility. Binding a reserved name (platform primitives,
 // time.Time), a nil example, a wire name already registered to a
 // different type, or one type to two names is an ErrUnsupported error;
-// re-binding the same pair is a no-op. RegisterAs does not consume the
+// re-binding the same pair is a no-op. Bindings are chain-scoped: a
+// wire name bound at one level of a pointer chain answers for every
+// level of that chain (the arg-form contract — the two ends of a stream
+// may bind the same name at different levels), a second RegisterAs
+// touching an existing binding's chain under a different name is an
+// ErrUnsupported error, and re-binding the same name at another chain
+// level is a no-op. RegisterAs does not consume the
 // stream.
 func (d *Decoder) RegisterAs(wireName string, example any) error {
 	t := reflect.TypeOf(example)
@@ -635,7 +683,15 @@ func (d *Decoder) RegisterAs(wireName string, example any) error {
 		return nil
 	}
 	if prev, ok := d.reg[wireName]; ok && prev != t {
+		if asChainRelated(prev, t) {
+			// a same-name rebind at another chain level: the existing
+			// binding already governs the whole chain
+			return nil
+		}
 		return errRegister(fmt.Sprintf("wire name %q already registered to %s", wireName, prev))
+	}
+	if prev, n, conflict := asChainConflict(t, wireName, d.asName); conflict {
+		return errRegister(fmt.Sprintf("type %s intersects the pointer chain of %s already bound to wire name %q", t, prev, n))
 	}
 	if d.reg == nil {
 		d.reg = make(map[string]reflect.Type)

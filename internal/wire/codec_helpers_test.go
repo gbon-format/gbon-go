@@ -314,3 +314,126 @@ func TestPeekRefWindowBoundary(t *testing.T) {
 		})
 	}
 }
+
+// Stream-edge regression row: peek-then-read sequences crossing a >largeRead
+// readDirect reset consume byte-identical sequences and keep Pos the
+// absolute consumed offset — the stream-mode reader tracks the
+// buffer-mode oracle at every step (the pending-lookahead
+// renormalization across the window reset).
+func TestKG3PeekAcrossDirectRead(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5A}, 2<<20)
+	var raw []byte
+	raw = append(raw, Magic...)
+	raw = append(raw, Major, Minor)
+	raw = append(raw, 0x64, 'a', 'b', 'c', 'd') // string literal → id 0
+	raw = append(raw, 0xC0)                     // REF → id 0
+	raw = append(raw, payload...)
+	raw = append(raw, 0x00, 0x11) // trailer: nil token, true token
+
+	newReaders := func() (sr, br *Reader) {
+		return NewStreamReader(bytes.NewReader(raw)), NewReader(raw)
+	}
+
+	// Sequence A: peek arms the track, the ref read retires it, then the
+	// large read crosses the reset.
+	sr, br := newReaders()
+	for _, r := range []*Reader{sr, br} {
+		if _, _, err := r.ReadHeader(); err != nil {
+			t.Fatalf("header: %v", err)
+		}
+		if _, err := r.ReadStringLit(); err != nil {
+			t.Fatalf("literal: %v", err)
+		}
+	}
+	for _, r := range []*Reader{sr, br} {
+		cls, err := r.PeekClass()
+		if err != nil || cls != ClassRef {
+			t.Fatalf("PeekClass = %d, %v", cls, err)
+		}
+		id, ok := r.PeekRef()
+		if !ok || id != 0 {
+			t.Fatalf("PeekRef = %d, %v", id, ok)
+		}
+		if got, err := r.ReadRef(); err != nil || got != 0 {
+			t.Fatalf("ReadRef = %d, %v", got, err)
+		}
+	}
+	sb, err := sr.ReadRawBytes(2 << 20)
+	if err != nil {
+		t.Fatalf("stream large read: %v", err)
+	}
+	bb, err := br.ReadRawBytes(2 << 20)
+	if err != nil {
+		t.Fatalf("buffer large read: %v", err)
+	}
+	if !bytes.Equal(sb, bb) || !bytes.Equal(sb, payload) {
+		t.Fatalf("large-read bytes diverge (stream %d, buffer %d, want %d)", len(sb), len(bb), len(payload))
+	}
+	if sr.Pos() != br.Pos() {
+		t.Fatalf("post-read Pos: stream %d, buffer %d", sr.Pos(), br.Pos())
+	}
+	st, err := sr.ReadRawBytes(2)
+	if err != nil {
+		t.Fatalf("stream trailer: %v", err)
+	}
+	bt, err := br.ReadRawBytes(2)
+	if err != nil {
+		t.Fatalf("buffer trailer: %v", err)
+	}
+	if !bytes.Equal(st, bt) {
+		t.Fatalf("trailer bytes diverge")
+	}
+	if sr.Pos() != len(raw) || br.Pos() != len(raw) {
+		t.Fatalf("final Pos: stream %d, buffer %d, want %d", sr.Pos(), br.Pos(), len(raw))
+	}
+
+	// Sequence B: the large read fires while the lookahead track is still
+	// armed (PeekRef unconsumed) — the reset's pending-copy serves the
+	// armed token's bytes as the buffer mode does.
+	sr, br = newReaders()
+	for _, r := range []*Reader{sr, br} {
+		if _, _, err := r.ReadHeader(); err != nil {
+			t.Fatalf("header: %v", err)
+		}
+		if _, err := r.ReadStringLit(); err != nil {
+			t.Fatalf("literal: %v", err)
+		}
+		if _, ok := r.PeekRef(); !ok {
+			t.Fatalf("PeekRef not ok")
+		}
+	}
+	sb, err = sr.ReadRawBytes(2 << 20)
+	if err != nil {
+		t.Fatalf("stream large read: %v", err)
+	}
+	bb, err = br.ReadRawBytes(2 << 20)
+	if err != nil {
+		t.Fatalf("buffer large read: %v", err)
+	}
+	if !bytes.Equal(sb, bb) {
+		t.Fatalf("armed large-read bytes diverge")
+	}
+	if !bytes.Equal(sb[:1], []byte{0xC0}) || !bytes.Equal(sb[1:], payload[:len(payload)-1]) {
+		t.Fatalf("armed large-read content: got %d bytes starting % X", len(sb), sb[:4])
+	}
+	if sr.Pos() != br.Pos() {
+		t.Fatalf("post-read Pos: stream %d, buffer %d", sr.Pos(), br.Pos())
+	}
+	st, err = sr.ReadRawBytes(2)
+	if err != nil {
+		t.Fatalf("stream trailer: %v", err)
+	}
+	bt, err = br.ReadRawBytes(2)
+	if err != nil {
+		t.Fatalf("buffer trailer: %v", err)
+	}
+	if !bytes.Equal(st, bt) {
+		t.Fatalf("trailer bytes diverge")
+	}
+	// The armed ref byte displaced one payload byte from the large read:
+	// both modes stand one byte short of the raw stream's end, with the
+	// last payload byte next.
+	if sr.Pos() != len(raw)-1 || br.Pos() != len(raw)-1 {
+		t.Fatalf("final Pos: stream %d, buffer %d, want %d", sr.Pos(), br.Pos(), len(raw)-1)
+	}
+}

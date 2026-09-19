@@ -207,6 +207,103 @@ func TestRegisterAsCollisions(t *testing.T) {
 	if err := enc.RegisterAs("n.C", raB{}); err == nil {
 		t.Fatal("mid-stream binding of an encoded type accepted")
 	}
+
+	// chain-collision lattice: one wire name per pointer chain, at any
+	// depth and in either arg order; the same name re-binding at another
+	// chain level is a no-op
+	v := raA{X: 1}
+	p := &v
+	pp := &p
+	ppp := &pp
+	t.Run("chain-family", func(t *testing.T) {
+		dec := gbon.NewDecoder(bytes.NewReader(nil))
+		if err := dec.RegisterAs("n.P", raA{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := dec.RegisterAs("n.Q", p); err == nil {
+			t.Fatal("cross-name chain intersection accepted (decoder)")
+		}
+		enc := gbon.NewEncoder(&bytes.Buffer{})
+		if err := enc.RegisterAs("n.P", raA{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.RegisterAs("n.Q", p); err == nil {
+			t.Fatal("cross-name chain intersection accepted (encoder)")
+		}
+	})
+	t.Run("chain-family-deep", func(t *testing.T) {
+		for _, deeper := range []any{pp, ppp} {
+			dec := gbon.NewDecoder(bytes.NewReader(nil))
+			if err := dec.RegisterAs("n.P", raA{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := dec.RegisterAs("n.Q", deeper); err == nil {
+				t.Fatalf("deep chain intersection accepted (%T)", deeper)
+			}
+		}
+	})
+	t.Run("chain-swap", func(t *testing.T) {
+		dec := gbon.NewDecoder(bytes.NewReader(nil))
+		if err := dec.RegisterAs("n.P", p); err != nil {
+			t.Fatal(err)
+		}
+		if err := dec.RegisterAs("n.Q", raA{}); err == nil {
+			t.Fatal("swapped arg-order chain intersection accepted")
+		}
+	})
+	t.Run("chain-crossdepth", func(t *testing.T) {
+		dec := gbon.NewDecoder(bytes.NewReader(nil))
+		if err := dec.RegisterAs("n.P", pp); err != nil {
+			t.Fatal(err)
+		}
+		if err := dec.RegisterAs("n.Q", p); err == nil {
+			t.Fatal("cross-depth chain intersection accepted")
+		}
+	})
+	t.Run("chain-samename", func(t *testing.T) {
+		dec := gbon.NewDecoder(bytes.NewReader(nil))
+		if err := dec.RegisterAs("n.P", raA{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := dec.RegisterAs("n.P", p); err != nil {
+			t.Fatalf("same-name chain extension not a no-op: %v", err)
+		}
+		enc := gbon.NewEncoder(&bytes.Buffer{})
+		if err := enc.RegisterAs("n.P", raA{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.RegisterAs("n.P", p); err != nil {
+			t.Fatalf("encoder same-name chain extension not a no-op: %v", err)
+		}
+	})
+	t.Run("chain-contraction", func(t *testing.T) {
+		dec := gbon.NewDecoder(bytes.NewReader(nil))
+		if err := dec.RegisterAs("n.P", p); err != nil {
+			t.Fatal(err)
+		}
+		if err := dec.RegisterAs("n.P", raA{}); err != nil {
+			t.Fatalf("same-name chain contraction not a no-op: %v", err)
+		}
+	})
+	t.Run("chain-register-carve", func(t *testing.T) {
+		dec := gbon.NewDecoder(bytes.NewReader(nil))
+		if err := dec.Register(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := dec.RegisterAs("n.P", raA{}); err != nil {
+			t.Fatalf("RegisterAs over a plain Register chain entry rejected: %v", err)
+		}
+	})
+	t.Run("chain-basic-carve", func(t *testing.T) {
+		dec := gbon.NewDecoder(bytes.NewReader(nil))
+		if err := dec.RegisterAs("n.P", new(int)); err != nil {
+			t.Fatalf("RegisterAs over a basicTypes seed rejected: %v", err)
+		}
+		enc := gbon.NewEncoder(&bytes.Buffer{})
+		if err := enc.RegisterAs("n.P", new(int)); err != nil {
+			t.Fatalf("encoder RegisterAs over a basicTypes seed rejected: %v", err)
+		}
+	})
 }
 
 // A binding registered between Decode calls is visible to subsequent
@@ -385,4 +482,155 @@ func TestRegisterAsAnySlotMapMismatchPathless(t *testing.T) {
 	if !strings.Contains(err.Error(), "stream kind 3, target ptr") {
 		t.Fatalf("map in any slot: text %q", err.Error())
 	}
+}
+
+// The RegisterAs arg-form matrix: one wire name bound at the value or
+// pointer level of one chain on the two ends round-trips in the V/V,
+// V/P and P/P combos; P/V keeps the kind-mismatch reject.
+func TestRegisterAsArgFormMatrix(t *testing.T) {
+	want := raPoint{X: -3, Y: 11}
+	encode := func(bind func(*gbon.Encoder) error) []byte {
+		var buf bytes.Buffer
+		enc := gbon.NewEncoder(&buf)
+		if err := bind(enc); err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.Encode([]any{&want}); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	roundTrip := func(t *testing.T, stream []byte, bind func(*gbon.Decoder) error) {
+		t.Helper()
+		dec := gbon.NewDecoder(bytes.NewReader(stream))
+		if err := bind(dec); err != nil {
+			t.Fatal(err)
+		}
+		var got []any
+		if err := dec.Decode(&got); err != nil {
+			t.Fatalf("round-trip: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("len drift: %d", len(got))
+		}
+		p, ok := got[0].(*raPoint)
+		if !ok || *p != want {
+			t.Fatalf("payload drift: %#v", got[0])
+		}
+	}
+	t.Run("value-value", func(t *testing.T) {
+		stream := encode(func(e *gbon.Encoder) error { return e.RegisterAs("app.P", raPoint{}) })
+		roundTrip(t, stream, func(d *gbon.Decoder) error { return d.RegisterAs("app.P", raPoint{}) })
+	})
+	t.Run("value-pointer", func(t *testing.T) {
+		stream := encode(func(e *gbon.Encoder) error { return e.RegisterAs("app.P", raPoint{}) })
+		roundTrip(t, stream, func(d *gbon.Decoder) error { return d.RegisterAs("app.P", &raPoint{}) })
+	})
+	t.Run("pointer-value", func(t *testing.T) {
+		stream := encode(func(e *gbon.Encoder) error { return e.RegisterAs("app.P", &raPoint{}) })
+		dec := gbon.NewDecoder(bytes.NewReader(stream))
+		if err := dec.RegisterAs("app.P", raPoint{}); err != nil {
+			t.Fatal(err)
+		}
+		var got []any
+		err := dec.Decode(&got)
+		var ge *gbon.Error
+		if !errors.As(err, &ge) || ge.Class() != "type_mismatch" {
+			t.Fatalf("pointer-value: %v", err)
+		}
+		if !strings.Contains(err.Error(), "stream kind 5, target struct") {
+			t.Fatalf("pointer-value: text %q", err.Error())
+		}
+	})
+	t.Run("pointer-pointer", func(t *testing.T) {
+		stream := encode(func(e *gbon.Encoder) error { return e.RegisterAs("app.P", &raPoint{}) })
+		roundTrip(t, stream, func(d *gbon.Decoder) error { return d.RegisterAs("app.P", &raPoint{}) })
+	})
+}
+
+// Chained star-implication over registered pointer entries: a grain tag
+// naming the base resolves through a registration at any star depth;
+// the unregistered chain still rejects, the one-level form is unchanged.
+func TestRegisterDeepChainGrain(t *testing.T) {
+	want := raPoint{X: 4, Y: -9}
+	v := want
+	p := &v
+	pp := &p
+	ppp := &pp
+	t.Run("depth2", func(t *testing.T) {
+		b := mustMarshal(t, pp)
+		dec := gbon.NewDecoder(bytes.NewReader(b))
+		if err := dec.Register(pp); err != nil {
+			t.Fatal(err)
+		}
+		var out any
+		if err := dec.Decode(&out); err != nil {
+			t.Fatalf("deep registration: %v", err)
+		}
+		got, ok := out.(**raPoint)
+		if !ok || **got != want {
+			t.Fatalf("deep registration: %#v", out)
+		}
+	})
+	t.Run("depth3", func(t *testing.T) {
+		b := mustMarshal(t, ppp)
+		dec := gbon.NewDecoder(bytes.NewReader(b))
+		if err := dec.Register(ppp); err != nil {
+			t.Fatal(err)
+		}
+		var out any
+		if err := dec.Decode(&out); err != nil {
+			t.Fatalf("depth-3 registration: %v", err)
+		}
+		d3, k := out.(***raPoint)
+		if !k || ***d3 != want {
+			t.Fatalf("depth-3 registration: %#v", out)
+		}
+	})
+	t.Run("onelevel", func(t *testing.T) {
+		b := mustMarshal(t, p)
+		dec := gbon.NewDecoder(bytes.NewReader(b))
+		if err := dec.Register(p); err != nil {
+			t.Fatal(err)
+		}
+		var out any
+		if err := dec.Decode(&out); err != nil {
+			t.Fatalf("one-level registration: %v", err)
+		}
+		got, ok := out.(*raPoint)
+		if !ok || *got != want {
+			t.Fatalf("one-level registration: %#v", out)
+		}
+	})
+	t.Run("unregistered", func(t *testing.T) {
+		b := mustMarshal(t, pp)
+		var out any
+		err := gbon.NewDecoder(bytes.NewReader(b)).Decode(&out)
+		var ge *gbon.Error
+		if !errors.As(err, &ge) || ge.Class() != "unknown_name" {
+			t.Fatalf("unregistered chain: %v", err)
+		}
+	})
+	t.Run("ring", func(t *testing.T) {
+		type drRing struct{ Next *drRing }
+		head := &drRing{}
+		head.Next = head
+		cell := &head
+		b := mustMarshal(t, cell)
+		dec := gbon.NewDecoder(bytes.NewReader(b))
+		if err := dec.Register(cell); err != nil {
+			t.Fatal(err)
+		}
+		var out any
+		if err := dec.Decode(&out); err != nil {
+			t.Fatalf("ring registration: %v", err)
+		}
+		got, ok := out.(**drRing)
+		if !ok {
+			t.Fatalf("ring registration: %#v", out)
+		}
+		if *got == nil || (*got).Next != *got {
+			t.Fatalf("ring identity: %#v", got)
+		}
+	})
 }

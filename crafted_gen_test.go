@@ -1408,3 +1408,6 @@ func TestSafeDescCyclicCrafted(t *testing.T) {
 		t.Fatalf("safeDescValue misses the cycle marker: %q", s)
 	}
 }
+
+// dBigint is the BIGINT descriptor: kind 15, canonical name.
+var dBigint = &cDesc{kind: 15, name: "big.Int"}

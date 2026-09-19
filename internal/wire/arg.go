@@ -166,7 +166,8 @@ func (w *Writer) writeExtArg(b []byte) {
 // readExtArg reads the extended argument: selector,
 // ARG length, big-endian bytes. Minimality is enforced — n < 9 or a zero
 // leading byte is ErrFormat; an advertised n above maxLen is ErrBudget
-// before the body is consumed (non-zero maxLen gates, decode budgets).
+// before the body is consumed (maxLen is the remaining share handed by
+// the codec's budget arithmetic).
 func (r *Reader) readExtArg(maxLen uint64) ([]byte, error) {
 	n, err := r.ReadArg()
 	if err != nil {
@@ -175,7 +176,7 @@ func (r *Reader) readExtArg(maxLen uint64) ([]byte, error) {
 	if n < extArgMinLen {
 		return nil, werr(kindMalformedArg, "wire: non-minimal ext argument length %d", n)
 	}
-	if maxLen != 0 && n > maxLen {
+	if n > maxLen {
 		return nil, werr(kindBudgetBytes, "wire: ext argument length %d exceeds budget %d", n, maxLen)
 	}
 	b, err := r.readN(n)

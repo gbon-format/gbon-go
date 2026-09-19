@@ -218,6 +218,18 @@ func (d *codecDecoder) chargeAlloc(l, es uint64, p pathNode) error {
 	return nil
 }
 
+// remainingBytes is the MaxBytes budget's unspent share at the current
+// position — the same arithmetic checkBytes enforces (consumed input
+// since the value's start plus charged allocations) — as the remaining
+// bound the wire guards receive on the decode and skip paths.
+func (d *codecDecoder) remainingBytes() uint64 {
+	used := d.r.Pos() - d.start + d.alloc
+	if used >= d.maxBytes {
+		return 0
+	}
+	return uint64(d.maxBytes - used)
+}
+
 // fail is the decode-error choke point: in trusted-input mode it captures
 // the input window around the error's offset — 32 bytes before, 16 after,
 // clamped to the reader's buffered bytes — and attaches it to the error
@@ -641,10 +653,11 @@ type codecStreamDecoder struct {
 }
 
 // init prepares the stream decoder: the source is wrapped for buffered
-// pull-based reading and the stream header is validated (first Decode).
-// Records decode incrementally: nothing beyond the in-flight record (plus
+// pull-based reading. The stream header is validated on the first Decode
+// (readHeader, under the Decode panic tripwire). Records decode
+// incrementally: nothing beyond the in-flight record (plus
 // lookahead) is held in memory.
-func (d *codecStreamDecoder) init(src io.Reader) error {
+func (d *codecStreamDecoder) init(src io.Reader) {
 	switch src.(type) {
 	case *bufio.Reader, *bytes.Reader, *bytes.Buffer, *strings.Reader:
 	default:
@@ -652,7 +665,6 @@ func (d *codecStreamDecoder) init(src io.Reader) error {
 	}
 	d.r = wire.NewStreamReader(src)
 	d.r.MaxDescDepth = maxDepth
-	d.started = true
 	if d.binds == nil {
 		d.binds = &coderBinds{}
 	}
@@ -662,10 +674,17 @@ func (d *codecStreamDecoder) init(src io.Reader) error {
 	if d.shr == nil {
 		d.shr = &decShared{}
 	}
+}
+
+// readHeader validates the stream header on the first Decode, inside the
+// panic tripwire: a reader panic in the header fill classifies like any
+// other fill instead of escaping the facade.
+func (d *codecStreamDecoder) readHeader() error {
 	if _, minor, err := d.r.ReadHeader(); err != nil {
 		return d.mapErrInit(err)
 	} else {
 		d.minor = minor
+		d.started = true
 	}
 	return nil
 }
@@ -688,6 +707,23 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 	if err != nil {
 		return err
 	}
+	eff := effLimits(l)
+	var rootRestore func()
+	var dec *codecDecoder
+	defer func() {
+		if p := recover(); p != nil {
+			err = dec.recoveredPanicError(p)
+		}
+		if rootRestore != nil && err != nil {
+			rootRestore()
+		}
+	}()
+	if !d.started {
+		if err := d.readHeader(); err != nil {
+			d.broken = err
+			return err
+		}
+	}
 	if d.r.AtEOF() {
 		if d.sawValue {
 			return io.EOF
@@ -701,17 +737,6 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 		d.broken = err
 		return err
 	}
-	eff := effLimits(l)
-	var rootRestore func()
-	var dec *codecDecoder
-	defer func() {
-		if p := recover(); p != nil {
-			err = dec.recoveredPanicError(p)
-		}
-		if rootRestore != nil && err != nil {
-			rootRestore()
-		}
-	}()
 	dec = newBudgetDecoder(d.r, eff, d.reg, d.coders, d.binds, d.fac, d.shared, d.asName, d.shr)
 	dec.legacy = d.minor == 0
 	desc, err := d.r.ReadDesc()
@@ -839,7 +864,7 @@ func (d *codecDecoder) decodeBody(desc *wire.Desc, target reflect.Value, p pathN
 		}
 		return nil
 	case wire.KindString:
-		s, err := d.r.ReadString()
+		s, err := d.r.ReadStringBudgeted(d.remainingBytes())
 		if err != nil {
 			return d.mapErr(err)
 		}
@@ -877,7 +902,7 @@ func (d *codecDecoder) decodeBody(desc *wire.Desc, target reflect.Value, p pathN
 // shapes. The advertised ext length is budget-gated before any
 // allocation.
 func (d *codecDecoder) decodeBigint(desc *wire.Desc, target reflect.Value, p pathNode) error {
-	n, err := d.r.ReadBigint(uint64(d.maxBytes))
+	n, err := d.r.ReadBigint(d.remainingBytes())
 	if err != nil {
 		return d.mapErr(err)
 	}
@@ -1059,6 +1084,16 @@ func (d *codecDecoder) resolveIface(desc *wire.Desc, target reflect.Value, p pat
 	return d.resolveConcrete(cd, target, p)
 }
 
+// unknownNameDetail appends the missing name literal in trusted input
+// mode (SetTrustedInput); the untrusted default interpolates no
+// input-derived literal (the no-leak render contract).
+func (d *codecDecoder) unknownNameDetail(hint, name string) string {
+	if d.fac != nil && d.fac.trusted {
+		return fmt.Sprintf("%s (missing name %q)", hint, name)
+	}
+	return hint
+}
+
 // resolveConcrete materializes a concrete dynamic value behind an already
 // read tag cd (the root position hands the tag in directly).
 func (d *codecDecoder) resolveConcrete(cd *wire.Desc, target reflect.Value, p pathNode) error {
@@ -1073,7 +1108,7 @@ func (d *codecDecoder) resolveConcrete(cd *wire.Desc, target reflect.Value, p pa
 		fmt.Printf("TRACE resolveConcrete name=%q reg=%v long-keys=%v\n", cd.Name, hit, rgx)
 	}
 	if d.reg == nil {
-		return d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail("interface concrete type needs a type registry: use Decoder.Register")))
+		return d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail(d.unknownNameDetail("interface concrete type needs a type registry: use Decoder.Register", cd.Name))))
 	}
 	rt, ok := d.reg[cd.Name]
 	if !ok {
@@ -1099,26 +1134,17 @@ func (d *codecDecoder) resolveConcrete(cd *wire.Desc, target reflect.Value, p pa
 func (d *codecDecoder) resolveDerived(cd *wire.Desc, target reflect.Value, p pathNode) error {
 	dt, ok := deriveIfacePtrChain(cd.Name)
 	if !ok {
-		// the derivation boundary: chains compose over named bases
-		// reached through the pool or a registered pointer entry — a
-		// directly registered bare name does not carry its pointer
-		// forms (the incomplete-registry contract)
-		dt, ok = deriveNamedChain(cd.Name, func(n string) (reflect.Type, bool) {
-			if rt, ok := d.grainNames[n]; ok && rt.Name() != "" {
-				return rt, true
-			}
-			for _, source := range []map[string]reflect.Type{d.reg, d.grainNames} {
-				if rt, ok := source["*"+n]; ok && rt.Kind() == reflect.Pointer && rt.Elem().Name() != "" {
-					return rt.Elem(), true
-				}
-			}
-			return nil, false
-		})
+		// the derivation boundary: chains compose over the rule-1
+		// family; a directly registered bare name does not carry its
+		// pointer forms (the incomplete-registry contract)
+		dt, ok = deriveNamedChain(cd.Name, d.resolveFamilyType)
 	}
 	if !ok {
-		return errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail("interface concrete type not registered: use Decoder.Register"))
+		return errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail(d.unknownNameDetail("interface concrete type not registered: use Decoder.Register", cd.Name)))
 	}
-	if err := match(cd, dt, true, make(map[*wire.Desc]bool), d.naming()); err != nil {
+	if err := match(cd, dt, true, make(map[*wire.Desc]bool), d.naming(), func(t reflect.Type, name string) bool {
+		return boundChainName(d.asName, t, name)
+	}); err != nil {
 		return withOffset(err, int(d.r.Pos()))
 	}
 	if st := target.Type(); st.Kind() == reflect.Interface && st.NumMethod() > 0 && !dt.Implements(st) {
@@ -2277,6 +2303,23 @@ func (d *codecDecoder) skipValue(desc *wire.Desc, path string) error {
 			}
 			return nil
 		}
+		// Mirror of decodeMap's REF branch: a leading REF names a map
+		// record registered earlier in the stream — consume the token
+		// (RecordMap) or reject typed at the REF offset before any byte
+		// moves; the map object stays unmaterialized.
+		if class, err := d.r.PeekClass(); err != nil {
+			return d.mapErr(err)
+		} else if class == wire.ClassRef {
+			if id, ok := d.r.PeekRef(); ok {
+				if k, _ := d.r.RecordAt(id); k != wire.RecordMap {
+					return d.fail(errFormat(classBadRef, d.r.Pos(), path, nil, nil, errDetail(fmt.Sprintf("ref %d is not a map record", id))))
+				}
+			}
+			if _, err := d.r.ReadRef(); err != nil {
+				return d.mapErr(err)
+			}
+			return nil
+		}
 		count, _, err := d.r.ReadMapHeader()
 		if err != nil {
 			return d.mapErr(err)
@@ -2397,7 +2440,7 @@ func (d *codecDecoder) skipValue(desc *wire.Desc, path string) error {
 		}
 		return d.skipValue(cd, path)
 	case wire.KindBigint:
-		if err := d.r.SkipBigint(uint64(d.maxBytes)); err != nil {
+		if err := d.r.SkipBigint(d.remainingBytes()); err != nil {
 			if errors.Is(err, wire.ErrBudget) {
 				return d.fail(errBudget(classBudgetBytes, d.r.Pos(), path, nil, d.maxBytes, err))
 			}
@@ -2444,7 +2487,7 @@ func (d *codecDecoder) skipStringToken(path string) error {
 		}
 		return nil
 	}
-	if _, err := d.r.SkipStringLit(uint64(d.maxBytes)); err != nil {
+	if _, err := d.r.SkipStringLit(d.remainingBytes()); err != nil {
 		if errors.Is(err, wire.ErrBudget) {
 			return d.fail(errBudget(classBudgetBytes, d.r.Pos(), path, nil, d.maxBytes, err))
 		}
@@ -2649,8 +2692,8 @@ func ifaceChain(t reflect.Type) bool {
 }
 
 // lookupGrainType resolves a wire name to a type through the registry
-// and the target-tree pool; a bare-name miss derives through a
-// registered pointer entry (registering *T implies T).
+// and the target-tree pool; a miss derives through the rule-1 family
+// at any star depth (see resolveInFamily).
 func (d *codecDecoder) lookupGrainType(n string) (reflect.Type, bool) {
 	if rt, ok := d.reg[n]; ok {
 		return rt, true
@@ -2658,12 +2701,20 @@ func (d *codecDecoder) lookupGrainType(n string) (reflect.Type, bool) {
 	if rt, ok := d.grainNames[n]; ok {
 		return rt, true
 	}
-	for _, source := range []map[string]reflect.Type{d.reg, d.grainNames} {
-		if rt, ok := source["*"+n]; ok && rt.Kind() == reflect.Pointer {
-			return rt.Elem(), true
-		}
+	return d.resolveFamilyType(n)
+}
+
+// resolveFamilyType adapts the rule-1 front door to full-name
+// resolution: the returned base re-wraps under the peeled star count.
+func (d *codecDecoder) resolveFamilyType(n string) (reflect.Type, bool) {
+	t, stars, ok := resolveInFamily(n, d.asName, d.reg, d.grainNames)
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+	for ; stars > 0; stars-- {
+		t = reflect.PointerTo(t)
+	}
+	return t, true
 }
 
 // legacyContainerGrain resolves the 0.0 container-grain reading: the
@@ -2850,10 +2901,7 @@ func (d *codecDecoder) grainTypeOf(gd *wire.Desc, p pathNode, depth int) (reflec
 		return nil, d.fail(errBudget(classBudgetDepth, d.r.Pos(), p.String(), nil, d.maxDepth, errDetail(fmt.Sprintf("grain tag nesting exceeds depth budget MaxDepth=%d", d.maxDepth))))
 	}
 	if gd.Name != "" {
-		if rt, ok := d.reg[gd.Name]; ok {
-			return rt, nil
-		}
-		if rt, ok := d.grainNames[gd.Name]; ok {
+		if rt, ok := d.lookupGrainType(gd.Name); ok {
 			return rt, nil
 		}
 		if dt, ok := deriveIfacePtrChain(gd.Name); ok {
@@ -2862,7 +2910,7 @@ func (d *codecDecoder) grainTypeOf(gd *wire.Desc, p pathNode, depth int) (reflec
 	}
 	if gd.Kind == wire.KindNamed {
 		if len(gd.Refs) == 0 {
-			return nil, d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), gd.Name, nil, errDetail("grain type not registered: use Decoder.Register")))
+			return nil, d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), gd.Name, nil, errDetail(d.unknownNameDetail("grain type not registered: use Decoder.Register", gd.Name))))
 		}
 		return d.grainTypeOf(gd.Refs[0], p, depth+1)
 	}

@@ -10,6 +10,7 @@ package gbon_test
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"go/format"
@@ -269,3 +270,69 @@ func TestSnippetIdentityMaterialize(t *testing.T) {
 		}
 	}
 }
+
+// PB6 — absolute offset and snippet site in a multi-record stream: the
+// budget breach of record 2's second blob reports Error.Offset at the
+// known absolute charge site (a window-relative site would be the
+// defect) and
+// the trusted-input snippet window is captured around that absolute
+// offset, clamped to the window base (the B1 body's readDirect reset
+// leaves the window starting at the B1 view token).
+func TestSnippetPB6AbsoluteOffsetGolden(t *testing.T) {
+	data, filler, _, afterB1, afterB2hdr := pb6Stream()
+	dec := gbon.NewDecoder(bytes.NewReader(data))
+	dec.SetLimits(gbon.Limits{MaxBytes: 8 << 20})
+	dec.SetTrustedInput(true)
+	var rec1 []byte
+	if err := dec.Decode(&rec1); err != nil {
+		t.Fatalf("record 1: %v", err)
+	}
+	if !bytes.Equal(rec1, filler) {
+		t.Fatalf("record 1 = %d bytes, want the %d-byte filler", len(rec1), len(filler))
+	}
+	var box pb6Box
+	err := dec.Decode(&box)
+	var ae *gbon.Error
+	if !errors.As(err, &ae) {
+		t.Fatalf("record 2: err = %v, want *gbon.Error", err)
+	}
+	if ae.Class() != "budget_bytes" || !errors.Is(err, gbon.ErrBudget) {
+		t.Fatalf("class = %q, err = %v, want budget_bytes/ErrBudget", ae.Class(), err)
+	}
+	if ae.Path != "$.B2" {
+		t.Fatalf("path = %q, want $.B2", ae.Path)
+	}
+	if ae.Offset != afterB2hdr {
+		t.Fatalf("Offset = %d, want absolute charge site %d", ae.Offset, afterB2hdr)
+	}
+	if ae.Offset < largeReadScale {
+		t.Fatalf("Offset = %d not >largeRead-scale", ae.Offset)
+	}
+	sn, ok := ae.Snippet()
+	if !ok {
+		t.Fatalf("no snippet captured in trusted mode")
+	}
+	winBase := afterB1 - 2 // the B1 view token: the window base after the body's reset
+	if sn.ByteOffset != winBase {
+		t.Fatalf("snippet ByteOffset = %d, want window base %d", sn.ByteOffset, winBase)
+	}
+	wantLen := afterB2hdr + snippetAfterLen - winBase
+	if sn.ByteLength != wantLen {
+		t.Fatalf("snippet ByteLength = %d, want %d", sn.ByteLength, wantLen)
+	}
+	want := data[winBase : winBase+wantLen]
+	got, derr := base64.StdEncoding.DecodeString(sn.Base64)
+	if derr != nil {
+		t.Fatalf("snippet base64: %v", derr)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("snippet bytes diverge from the stream window")
+	}
+}
+
+// PB6 scale pins: the wire large-read threshold (stream reads above it
+// bypass the sliding window) and the snippet's after-window extent.
+const (
+	largeReadScale  = 1 << 20
+	snippetAfterLen = 16
+)

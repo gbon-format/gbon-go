@@ -47,7 +47,11 @@
 // bytes). Decoder.SetLimits and Encoder.SetLimits configure them per
 // stream. On the decode side MaxBytes is a single counter for input bytes
 // plus derived backing allocations, charged as L·elemsize (implicit zero
-// tails included) before the allocation happens. Exceeding a budget
+// tails included) before the allocation happens. The counter's scope is
+// one value: it opens at each record's start and resets when the next
+// record begins, so cumulative consumption beyond MaxBytes across the
+// records of a stream is conformant — there is no per-stream cumulative
+// cap. Exceeding a budget
 // fails with ErrBudget naming it; on the Encoder a negative MaxBytes
 // removes the byte cap. The decoders are fuzz-hardened: arbitrary input
 // yields a sentinel error, never a panic or a hang. The decoder consumes
@@ -107,7 +111,9 @@
 // family under raised limits maps to budget_alloc; any other panic
 // decodes to internal_panic with the panic value in Got and a bounded
 // stack through Stack. The encode path has no recover, so a value that
-// panics during encoding propagates the panic.
+// panics during encoding propagates the panic, and the Encoder is broken
+// from that point on: every subsequent Encode returns the same sticky
+// internal_panic error without writing — discard the Encoder.
 //
 // The %v form is one line — gbon: <class>, then the path and offset
 // segments when the class carries that context — and the %+v form

@@ -103,6 +103,10 @@ func TestShapeDeriveFamilyBoundary(t *testing.T) {
 		{"array over chain", dArray(3, dPtr(dIface)), nil, "unknown_name"},
 		{"iface-key map over chain", dMap(dIface, dPtr(dIface)), nil, "unknown_name"},
 		{"pointer over composite", &cDesc{kind: 5, name: "**[]interface {}", refs: []*cDesc{dSlice(dIface)}}, nil, "unknown_name"},
+		{"pointer over slice", &cDesc{kind: 5, name: "*[]interface {}", refs: []*cDesc{dSlice(dIface)}}, nil, "unknown_name"},
+		{"pointer over any map", &cDesc{kind: 5, name: "*map[string]interface {}", refs: []*cDesc{dMap(dString, dIface)}}, nil, "unknown_name"},
+		{"pointer over int64 map", &cDesc{kind: 5, name: "*map[string]int64", refs: []*cDesc{dMap(dString, dInt64)}}, nil, "unknown_name"},
+		{"int64-valued map", dMap(dString, dInt64), nil, "unknown_name"},
 		{"named type", dNamed("vec.pair", dInt64), nil, "unknown_name"},
 		{"named pointer", dNamed("*vec.pair", dPtr(dInt64)), nil, "unknown_name"},
 		{"chain over wrong element", &cDesc{kind: 5, name: "**interface {}", refs: []*cDesc{dInt64}}, func(c *craft) { c.intTok(7) }, "type_mismatch"},
@@ -124,6 +128,28 @@ func TestShapeDeriveFamilyBoundary(t *testing.T) {
 				t.Fatalf("want class %s, got %v", tc.class, err)
 			}
 		})
+	}
+	// the derivable surface without registration (grammar chains,
+	// composites over them, the basic seeds): values decode through the
+	// any root and re-encode byte-identically
+	v := any(int64(7))
+	p := &v
+	for _, val := range []any{
+		int64(7), "txt", true, 2.5, []byte("bb"),
+		[]any{int64(7)}, []int64{7}, []string{"s"}, map[string]string{"k": "v"},
+		map[string]any{"k": int64(7)}, []*any{p}, map[string]*any{"k": p},
+	} {
+		b := mustMarshal(t, val)
+		var out any
+		if err := gbon.Unmarshal(b, &out); err != nil {
+			t.Fatalf("%T: %v", val, err)
+		}
+		if !reflect.DeepEqual(out, val) {
+			t.Fatalf("%T: round-trip drift: %#v", val, out)
+		}
+		if !bytes.Equal(mustMarshal(t, out), b) {
+			t.Fatalf("%T: re-encode drift", val)
+		}
 	}
 }
 
@@ -160,7 +186,9 @@ func TestShapeDeriveRegisterPrecedence(t *testing.T) {
 	}
 }
 
-// The named-miss text stays verbatim for names outside the family.
+// The named-miss text stays verbatim for names outside the family; in
+// trusted input mode the detail carries the missing name literal and
+// the structured got field holds the name in both modes.
 func TestShapeDeriveNamedMissText(t *testing.T) {
 	c := newCraft()
 	c.descPos(dArray(3, dPtr(dIface)))
@@ -168,6 +196,19 @@ func TestShapeDeriveNamedMissText(t *testing.T) {
 	err := gbon.NewDecoder(bytes.NewReader(c.buf)).Decode(&out)
 	if err == nil || !strings.Contains(err.Error(), "interface concrete type not registered: use Decoder.Register") {
 		t.Fatalf("verbatim hint expected, got %v", err)
+	}
+	var ge *gbon.Error
+	if !errors.As(err, &ge) || ge.Got != "[3]*interface {}" {
+		t.Fatalf("untrusted got field: %v", err)
+	}
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	dec.SetTrustedInput(true)
+	err = dec.Decode(&out)
+	if err == nil || !strings.Contains(err.Error(), `(missing name "[3]*interface {}")`) {
+		t.Fatalf("trusted detail expected, got %v", err)
+	}
+	if !errors.As(err, &ge) || ge.Got != "[3]*interface {}" {
+		t.Fatalf("trusted got field: %v", err)
 	}
 }
 

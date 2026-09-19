@@ -472,8 +472,10 @@ func (r *Reader) AtEOF() bool {
 	return r.pos >= len(r.buf)
 }
 
-// Pos returns the current read offset into the input.
-func (r *Reader) Pos() int { return r.pos }
+// Pos returns the absolute consumed offset from the start of the input:
+// the sliding window's base plus the position inside it (buffer mode has
+// base 0, so this is the plain position).
+func (r *Reader) Pos() int { return r.base + r.pos }
 
 // Window returns the read-only window of the current sliding buffer
 // around the absolute offset off: [max(base, off-before), min(base+len,
@@ -610,6 +612,10 @@ func (r *Reader) readN(n uint64) ([]byte, error) {
 // straight from the source. The buffer grows amortized as bytes actually
 // arrive; the declared length never sizes an allocation, so a truncated
 // source costs a transient proportional to the bytes it really delivered.
+// Every served byte advances base, so Pos stays the absolute consumed
+// offset across the window reset; the buffered part's advance happens
+// before the serve loop, keeping the truncation error's offset the true
+// end-of-input site.
 func (r *Reader) readDirect(n uint64) ([]byte, error) {
 	pending := len(r.buf) - r.pos
 	out := make([]byte, pending, pending+readDirectInit)
@@ -630,6 +636,7 @@ func (r *Reader) readDirect(n uint64) ([]byte, error) {
 		}
 		nr, err := r.src.Read(out[len(out):cap(out)])
 		out = out[:len(out)+nr]
+		r.base += nr
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return nil, werrAt(int(r.base), kindTruncated, "wire: truncated body (need %d bytes)", n)

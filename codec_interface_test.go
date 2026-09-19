@@ -361,7 +361,9 @@ func TestBudgetDefaults(t *testing.T) {
 	huge := strings.Repeat("a", 100000001)
 	var so string
 	err = gbon.Unmarshal(mustMarshal(t, huge), &so)
-	if !errors.Is(err, gbon.ErrBudget) || !strings.Contains(err.Error(), "MaxBytes") {
+	// The default MaxBytes fires pre-read at the wire guard: the message
+	// names the guard's remaining bound, the class stays budget_bytes.
+	if !errors.Is(err, gbon.ErrBudget) || !strings.Contains(err.Error(), "exceeds budget") {
 		t.Fatalf("MaxBytes: %v", err)
 	}
 }

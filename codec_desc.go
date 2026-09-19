@@ -123,6 +123,74 @@ func deriveNamedChain(name string, resolve func(string) (reflect.Type, bool)) (r
 	return nil, false
 }
 
+// resolveInFamily is the rule-1 registration-closure resolver: leading
+// pointer stars peel onto the returned star count for the caller to
+// re-wrap; the base resolves inside the binding family (familyBase).
+func resolveInFamily(n string, bindings map[reflect.Type]string, reg, pool map[string]reflect.Type) (reflect.Type, int, bool) {
+	stars := 0
+	base := n
+	for strings.HasPrefix(base, "*") {
+		stars++
+		base = base[1:]
+	}
+	t, ok := familyBase(base, bindings, reg, pool)
+	if !ok {
+		return nil, 0, false
+	}
+	return t, stars, true
+}
+
+// familyBase resolves a starless name inside the rule-1 family: a bound
+// wire name, the canonical name of a binding's chain level, a named
+// pool entry, or the implied base of a registered pointer entry.
+func familyBase(base string, bindings map[reflect.Type]string, reg, pool map[string]reflect.Type) (reflect.Type, bool) {
+	for t, n := range bindings {
+		if n == base {
+			return t, true
+		}
+	}
+	for t := range bindings {
+		for u := t; ; u = u.Elem() {
+			if nameOf(u) == base {
+				return u, true
+			}
+			if u.Kind() != reflect.Pointer {
+				break
+			}
+		}
+	}
+	if rt, ok := pool[base]; ok && rt.Name() != "" {
+		return rt, true
+	}
+	for _, source := range []map[string]reflect.Type{reg, pool} {
+		for key, rt := range source {
+			kBase := key
+			for strings.HasPrefix(kBase, "*") {
+				kBase = kBase[1:]
+			}
+			if kBase != base || kBase == key {
+				continue
+			}
+			if u, named := peelStarChain(rt, strings.Count(key, "*")); named {
+				return u, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// peelStarChain peels j pointer levels off a registered pointer entry,
+// reporting whether the remaining base is a named type.
+func peelStarChain(rt reflect.Type, j int) (reflect.Type, bool) {
+	for range j {
+		if rt.Kind() != reflect.Pointer {
+			return nil, false
+		}
+		rt = rt.Elem()
+	}
+	return rt, rt.Name() != ""
+}
+
 // qualifiedName is the name of a defined type outside the standard
 // library: import path + "." + the short t.String() form. Standard
 // library and main packages keep the short form (wire-byte stability for
@@ -171,6 +239,52 @@ func namingOf(asName map[reflect.Type]string) nameOverride {
 		n, ok := asName[t]
 		return n, ok
 	}
+}
+
+// asChainBase strips a type's pointer chain to its base level: one
+// RegisterAs binding governs every level of its chain.
+func asChainBase(t reflect.Type) reflect.Type {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t
+}
+
+// asChainRelated reports whether a and b sit on one pointer chain
+// (any depth on either side).
+func asChainRelated(a, b reflect.Type) bool {
+	return asChainBase(a) == asChainBase(b)
+}
+
+// boundChainName reports whether name is bound through RegisterAs to a
+// level of t's pointer chain: the arg-form contract lets the two ends
+// bind one wire name at different levels of one chain.
+func boundChainName(asName map[reflect.Type]string, t reflect.Type, name string) bool {
+	if name == "" || len(asName) == 0 {
+		return false
+	}
+	for bt, n := range asName {
+		if n == name && asChainRelated(bt, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// asChainConflict reports whether binding wireName to t crosses a
+// RegisterAs binding of the same chain under a different name; names
+// equal up to leading stars are one name (chain-extension convention).
+func asChainConflict(t reflect.Type, wireName string, asName map[reflect.Type]string) (reflect.Type, string, bool) {
+	nameBase := strings.TrimLeft(wireName, "*")
+	for prev, n := range asName {
+		if prev == t || strings.TrimLeft(n, "*") == nameBase {
+			continue
+		}
+		if asChainRelated(prev, t) {
+			return prev, n, true
+		}
+	}
+	return nil, "", false
 }
 
 // isUnnamedByteSlice reports t == []byte (the BLOB canonical form).
@@ -441,18 +555,19 @@ func descWalk(t reflect.Type, path string, cache map[reflect.Type]*wire.Desc, ho
 // under a scope naming: bound target types match their bound wire name
 // instead of nameOf(t).
 func matchDescNamed(d *wire.Desc, t reflect.Type, naming nameOverride) error {
-	return match(d, t, false, make(map[*wire.Desc]bool), naming)
+	return match(d, t, false, make(map[*wire.Desc]bool), naming, nil)
 }
 
 // match walks d against t; visiting memoizes in-progress descriptors so
 // self-referential types terminate (assume a match on the back edge).
-func match(d *wire.Desc, t reflect.Type, skipName bool, visiting map[*wire.Desc]bool, naming nameOverride) error {
+// chainName (optional) accepts a name bound to another chain level.
+func match(d *wire.Desc, t reflect.Type, skipName bool, visiting map[*wire.Desc]bool, naming nameOverride, chainName func(reflect.Type, string) bool) error {
 	if visiting[d] {
 		return nil
 	}
 	visiting[d] = true
 	tn := scopeName(naming, t)
-	if !skipName && tn != d.Name {
+	if !skipName && tn != d.Name && !(chainName != nil && chainName(t, d.Name)) {
 		// Pointer-ness of the built-in BIGINT kind is absorbed by the
 		// kind: the wire name "big.Int" matches both
 		// Go projections, in both the canonical kind-15 form and the
@@ -470,7 +585,7 @@ func match(d *wire.Desc, t reflect.Type, skipName bool, visiting map[*wire.Desc]
 		if t.Name() == "" || t.PkgPath() == "" {
 			return kindMismatch()
 		}
-		return match(d.Refs[0], t, true, visiting, naming)
+		return match(d.Refs[0], t, true, visiting, naming, chainName)
 	case wire.KindCoder:
 		// opaque body: the name is the only structural anchor
 	case wire.KindBool:
@@ -518,12 +633,12 @@ func match(d *wire.Desc, t reflect.Type, skipName bool, visiting map[*wire.Desc]
 		if isByteSliceBase(t) {
 			return errFormat(classTypeMismatch, -1, "", d.Name, nameOf(t), errDetail("stream kind SLICE, target is a byte-slice base (canonical kind is BLOB per the wire specification)"))
 		}
-		return match(d.Refs[0], t.Elem(), false, visiting, naming)
+		return match(d.Refs[0], t.Elem(), false, visiting, naming, chainName)
 	case wire.KindArray:
 		if t.Kind() != reflect.Array || uint64(t.Len()) != d.Len {
 			return kindMismatch()
 		}
-		return match(d.Refs[0], t.Elem(), false, visiting, naming)
+		return match(d.Refs[0], t.Elem(), false, visiting, naming, chainName)
 	case wire.KindMap:
 		if t.Kind() != reflect.Map {
 			return kindMismatch()
@@ -531,15 +646,15 @@ func match(d *wire.Desc, t reflect.Type, skipName bool, visiting map[*wire.Desc]
 		if !comparableKeyKind(t.Key().Kind()) {
 			return unsupportedAt("map key type "+nameOf(t.Key()), nameOf(t))
 		}
-		if err := match(d.Refs[0], t.Key(), false, visiting, naming); err != nil {
+		if err := match(d.Refs[0], t.Key(), false, visiting, naming, chainName); err != nil {
 			return err
 		}
-		return match(d.Refs[1], t.Elem(), false, visiting, naming)
+		return match(d.Refs[1], t.Elem(), false, visiting, naming, chainName)
 	case wire.KindPointer:
 		if t.Kind() != reflect.Pointer {
 			return kindMismatch()
 		}
-		return match(d.Refs[0], t.Elem(), false, visiting, naming)
+		return match(d.Refs[0], t.Elem(), false, visiting, naming, chainName)
 	case wire.KindStruct:
 		if t.Kind() != reflect.Struct {
 			return kindMismatch()
@@ -553,7 +668,7 @@ func match(d *wire.Desc, t reflect.Type, skipName bool, visiting map[*wire.Desc]
 			if !ok || f.Name == "_" || f.PkgPath != "" {
 				continue
 			}
-			if err := match(sf.Type, f.Type, false, visiting, naming); err != nil {
+			if err := match(sf.Type, f.Type, false, visiting, naming, chainName); err != nil {
 				return err
 			}
 		}

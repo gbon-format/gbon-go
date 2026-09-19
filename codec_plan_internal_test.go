@@ -294,9 +294,7 @@ func decodeMode(t *testing.T, b []byte, referenceLeg bool, prep func(*Decoder), 
 		prep(dec)
 	}
 	sd := &codecStreamDecoder{reg: dec.reg, asName: dec.asName, coders: dec.coders, fac: dec}
-	if err := sd.init(bytes.NewReader(b)); err != nil {
-		return err.Error()
-	}
+	sd.init(bytes.NewReader(b))
 	sd.shr.referenceLeg = referenceLeg
 	dec.dec = sd
 	v := mk()
@@ -379,9 +377,7 @@ func TestPlanDecodeCompiledMatchesReference(t *testing.T) {
 				tc.prep(db)
 			}
 			db.dec = &codecStreamDecoder{reg: db.reg, asName: db.asName, coders: db.coders, fac: db}
-			if err := db.dec.init(bytes.NewReader(b)); err != nil {
-				t.Fatal(err)
-			}
+			db.dec.init(bytes.NewReader(b))
 			db.dec.shr.referenceLeg = true
 			if err := da.Decode(va); err != nil {
 				t.Fatal(err)

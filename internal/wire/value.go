@@ -171,7 +171,8 @@ func (w *Writer) WriteBigint(v *big.Int) error {
 // The zero/nil coincidence byte yields a nil value: callers
 // materialize it per their projection — nil for pointer shapes, zero for
 // value shapes. An advertised ext length above maxLen is ErrBudget before
-// any allocation (non-zero maxLen gates, decode budgets).
+// any allocation (maxLen is the remaining share handed by the codec's
+// budget arithmetic).
 func (r *Reader) ReadBigint(maxLen uint64) (*big.Int, error) {
 	b, err := r.byteAt()
 	if err != nil {
@@ -303,8 +304,10 @@ func (w *Writer) WriteString(s string) error {
 }
 
 // ReadStringLit reads a STRING literal and registers it in the intern space.
+// The advertised length is unbounded (materializing call sites without a
+// budget context).
 func (r *Reader) ReadStringLit() (string, error) {
-	return r.readStringLit(0)
+	return r.readStringLit(math.MaxUint64)
 }
 
 // SkipStringLit reads a skipped STRING literal position (codec skip
@@ -320,7 +323,7 @@ func (r *Reader) readStringLit(maxLen uint64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if maxLen != 0 && n > maxLen {
+	if n > maxLen {
 		return "", werr(kindBudgetBytes, "wire: string length %d exceeds budget %d", n, maxLen)
 	}
 	b, err := r.readN(n)
@@ -333,15 +336,25 @@ func (r *Reader) readStringLit(maxLen uint64) (string, error) {
 }
 
 // ReadString reads a string position: STRING literal or REF to a record
-// interned string.
+// interned string, with the advertised literal length unbounded.
 func (r *Reader) ReadString() (string, error) {
+	return r.ReadStringBudgeted(math.MaxUint64)
+}
+
+// ReadStringBudgeted reads a string position: STRING literal or REF to a
+// record interned string, with the advertised literal length gated
+// against rem before the body is consumed — a literal longer than rem is
+// ErrBudget pre-read (rem is the unspent budget share the codec derives;
+// the same readStringLit guard the skip paths take, so decode and skip
+// charge by one mechanism).
+func (r *Reader) ReadStringBudgeted(rem uint64) (string, error) {
 	form, err := r.peekFirst()
 	if err != nil {
 		return "", err
 	}
 	switch form {
 	case classString:
-		return r.ReadStringLit()
+		return r.readStringLit(rem)
 	case classRef:
 		id, err := r.ReadRef()
 		if err != nil {

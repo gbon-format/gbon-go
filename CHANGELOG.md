@@ -7,8 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-19
+
+### Fixed
+
+- Decoder budget accounting is absolute: `MaxBytes` now counts
+  input and charged allocation bytes against the true stream position
+  (intra-record window resets no longer under-count; strings and
+  bigints are budget-guarded before the read on both the value and the
+  skip path), and error `Offset`s on multi-record streams are the
+  documented absolute positions (was: window-relative after the first
+  record boundary).
+- Registration closure: chained pointer implication (both directions)
+  and a canonical-name bridge in the decoder's name resolution — a
+  `**T` root decodes through `Register((**T)(nil))` (the typed
+  slot-root shape), and `RegisterAs` value-form registrations resolve
+  over any-slot payloads (encoder value/decoder value and value/pointer
+  combos round-trip; pointer-name/struct-target stays a typed
+  `type_mismatch`). Family collisions of chained registrations are
+  rejected loudly (`register_conflict`); wire names equal up to
+  leading stars are one chain name.
+- Skipping a narrowed field no longer mis-parses when the skipped value
+  is a shared map record (`skipValue` consumes the leading reference
+  and mirrors the decode path; wrong sorts fail typed). The wire-format
+  conformance section gains an explicit carve-out: decode-into-narrower
+  over aliased map-records and shared backings rejects loudly instead
+  of materializing skipped substructure (spec vectors V-115..117).
+- Never-panic coverage: an `Encoder` whose `Encode` panicked is
+  permanently broken (sticky typed error before any further write; the
+  panic itself still propagates unchanged), and the decode tripwire is
+  armed before the first stream read (a reader failing inside the very
+  first fill is now classified, not escaping).
+
 ### Added
 
+- Error-golden corpus (13 rows) pinning the touched error surfaces
+  (budget/absolute offsets; `unknown_name` trusted-mode detail with the
+  missing name — untrusted rendering unchanged; `register_conflict`;
+  parity carve-out rejects; never-panic window classes) against
+  class/offset/path drift.
 - Stable mode (encoder guard): `MarshalStable` and `Encoder.SetStable`
   reject values outside the stable class — map pairs tied in key skeleton
   and value bytes (pointer tie-break order) and zero float map keys of
@@ -190,6 +227,7 @@ faster, and long-lived streams hold far less memory.
   never panics, hangs, or surprise allocations.
 - Stdlib-only single module `gbon` (codec, `internal/wire`).
 
-[Unreleased]: https://github.com/gbon-format/gbon-go/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/gbon-format/gbon-go/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/gbon-format/gbon-go/compare/v0.1.0...v0.1.1
 [0.0.2]: https://github.com/gbon-format/gbon-go/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/gbon-format/gbon-go/releases/tag/v0.0.1

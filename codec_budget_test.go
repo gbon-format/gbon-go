@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math/big"
 	"reflect"
 	"strings"
 	"testing"
@@ -556,5 +557,452 @@ func TestBudgetNamedHopsThresholds(t *testing.T) {
 	}
 	if _, err := strucE3(8, 1<<30); !errors.Is(err, gbon.ErrBudget) {
 		t.Fatalf("struct E=3 MaxDepth=8: err = %v, want ErrBudget", err)
+	}
+}
+
+// pb6Box is the PB6 record-2 target: two blob fields, B1 within budget,
+// B2 overdraw.
+type pb6Box struct{ B1, B2 []byte }
+
+// pb6Stream builds the PB6 fixture: record 1 is a ~2.1 MB blob; record 2
+// is a struct whose B1 blob fits the one-counter budget (input + charged
+// backing ≤ 8 MB) and whose B2 blob (7 MB advertised, dense 0) overdraws
+// at its header charge. The snapshots pin the absolute sites: afterB1
+// (window base at the B2 charge) and afterB2hdr (the charge's offset).
+func pb6Stream() (data []byte, filler, b1 []byte, afterB1, afterB2hdr int) {
+	c := newCraft()
+	c.descPos(dBlob)
+	filler = bytes.Repeat([]byte{0x61}, 2<<20+66)
+	r1 := c.blobRec(uint64(len(filler)), uint64(len(filler)), filler)
+	c.view0(r1)
+	c.descPos(dStructT(qn(pb6Box{}), cField{"B1", dBlob}, cField{"B2", dBlob}))
+	c.structTok()
+	b1 = bytes.Repeat([]byte{0x62}, 7<<19) // 3.5 MB: input + alloc = 7 MB <= 8 MB
+	r2 := c.blobRec(uint64(len(b1)), uint64(len(b1)), b1)
+	c.view0(r2)
+	afterB1 = len(c.buf)
+	r3 := c.blobRec(7<<20, 0, nil)
+	afterB2hdr = len(c.buf)
+	c.view0(r3)
+	// Record-3 prefix (nil tokens), never parsed: keeps the snippet's
+	// after-window unclamped.
+	c.buf = append(c.buf, make([]byte, 32)...)
+	return c.buf, filler, b1, afterB1, afterB2hdr
+}
+
+// TRUNC — a >largeRead advertised read hitting EOF after partial
+// service reports kindTruncated at the true absolute end-of-input site
+// (buffered pos+pending plus served bytes), not the pre-loop base.
+func TestBudgetTRUNCOffsetAbsolute(t *testing.T) {
+	const present = 1 << 20
+	c := newCraft()
+	c.descPos(dString)
+	c.tokenArg(0x6, 4<<20)
+	c.buf = append(c.buf, bytes.Repeat([]byte{0x61}, present)...)
+	data := c.buf
+	dec := gbon.NewDecoder(bytes.NewReader(data))
+	dec.SetLimits(gbon.Limits{MaxBytes: 64 << 20})
+	var s string
+	err := dec.Decode(&s)
+	var ae *gbon.Error
+	if !errors.As(err, &ae) {
+		t.Fatalf("Decode: err = %v, want *gbon.Error", err)
+	}
+	if ae.Class() != "truncated" {
+		t.Fatalf("class = %q, want truncated (err %v)", ae.Class(), err)
+	}
+	if ae.Offset != len(data) {
+		t.Fatalf("Offset = %d, want absolute EOF site %d", ae.Offset, len(data))
+	}
+}
+
+// ca1Box is the @CA1 target: six present string fields.
+type ca1Box struct{ S1, S2, S3, S4, S5, S6 string }
+
+// CA1 — six PRESENT 7 MB strings in one record over MaxBytes=8 MB: the
+// second string's consumption overdraws the one-counter budget. Class
+// oracle: the pre-read guard and the post-read check both reject the
+// overdraw with budget_bytes.
+func TestBudgetCA1SixStrings(t *testing.T) {
+	c := newCraft()
+	c.descPos(dStructT(qn(ca1Box{}),
+		cField{"S1", dString}, cField{"S2", dString}, cField{"S3", dString},
+		cField{"S4", dString}, cField{"S5", dString}, cField{"S6", dString}))
+	c.structTok()
+	for i := range 6 {
+		c.strPos(strings.Repeat(string(rune('A'+i)), 7<<20))
+	}
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	dec.SetLimits(gbon.Limits{MaxBytes: 8 << 20})
+	var box ca1Box
+	if err := dec.Decode(&box); !errors.Is(err, gbon.ErrBudget) {
+		t.Fatalf("Decode: err = %v, want ErrBudget", err)
+	}
+}
+
+// MULTI era-stable targets: multiPairBox carries the exact-rem pair
+// (present), multiGapPairBox/multiGapBox lack the wire fields (skip path
+// via gap decode).
+type multiPairBox struct{ S1, S2 string }
+
+type multiGapPairBox struct{}
+
+type multiGapBox struct{}
+
+// multiBreach writes j-1 clean 1.5 MB string records (>largeRead axis:
+// each forces a readDirect window reset) and one breach record of the
+// kind; the return is the stream and the expected absolute offset of its
+// budget_bytes error. String cells advertise exactly the remaining
+// budget for the second field with the body present — the wire guard
+// admits the length (L == remaining) and the post-read check fires
+// after the body; bigint cells advertise past the full budget and the
+// wire guard fires at the length-arg site; the blob cell fires at the
+// header charge.
+func multiBreach(kind string, j int) (data []byte, want int) {
+	const budget = 2 << 20
+	c := newCraft()
+	for i := 1; i < j; i++ {
+		c.descPos(dString)
+		c.strPos(strings.Repeat(string(rune('a'+i)), 3<<19))
+	}
+	switch kind {
+	case "present-string":
+		rec := len(c.buf)
+		c.descPos(dStructT(qn(multiPairBox{}), cField{"S1", dString}, cField{"S2", dString}))
+		c.structTok()
+		c.strPos(strings.Repeat("x", 3<<19))
+		rem := int(budget) - (len(c.buf) - rec)
+		c.tokenArg(0x6, uint64(rem))
+		c.buf = append(c.buf, bytes.Repeat([]byte{0x79}, rem)...)
+		return c.buf, len(c.buf)
+	case "skipped-string":
+		rec := len(c.buf)
+		c.descPos(dStructT(qn(multiGapPairBox{}), cField{"S1", dString}, cField{"S2", dString}))
+		c.structTok()
+		c.strPos(strings.Repeat("x", 3<<19))
+		rem := int(budget) - (len(c.buf) - rec)
+		c.tokenArg(0x6, uint64(rem))
+		c.buf = append(c.buf, bytes.Repeat([]byte{0x79}, rem)...)
+		return c.buf, len(c.buf)
+	case "present-bigint":
+		c.descPos(dBigint)
+		c.buf = append(c.buf, 0x10)
+		c.arg(5 << 19)
+		return c.buf, len(c.buf)
+	case "skipped-bigint":
+		c.descPos(dStructT(qn(multiGapBox{}), cField{"B", dBigint}))
+		c.structTok()
+		c.buf = append(c.buf, 0x10)
+		c.arg(5 << 19)
+		return c.buf, len(c.buf)
+	case "blob":
+		c.descPos(dBlob)
+		c.tokenArg(0x7, 3<<20)
+		c.arg(0)
+		return c.buf, len(c.buf)
+	}
+	panic("unreachable kind " + kind)
+}
+
+// MULTI — for every breach position j∈{1..4} and field kind, the
+// budget error's offset equals its constructed absolute site, and the
+// sites strictly increase with j (per-value windows over a compacting
+// multi-record stream).
+func TestBudgetMULTIAbsoluteOffsets(t *testing.T) {
+	targets := map[string]func() any{
+		"present-string": func() any { return new(multiPairBox) },
+		"skipped-string": func() any { return new(multiGapPairBox) },
+		"present-bigint": func() any { return new(big.Int) },
+		"skipped-bigint": func() any { return new(multiGapBox) },
+		"blob":           func() any { return new([]byte) },
+	}
+	for _, kind := range []string{"present-string", "skipped-string", "present-bigint", "skipped-bigint", "blob"} {
+		prev := -1
+		for j := 1; j <= 4; j++ {
+			data, want := multiBreach(kind, j)
+			dec := gbon.NewDecoder(bytes.NewReader(data))
+			dec.SetLimits(gbon.Limits{MaxBytes: 2 << 20})
+			var s string
+			for i := 1; i < j; i++ {
+				if err := dec.Decode(&s); err != nil {
+					t.Fatalf("%s j=%d: clean record %d: %v", kind, j, i, err)
+				}
+			}
+			err := dec.Decode(targets[kind]())
+			var ae *gbon.Error
+			if !errors.As(err, &ae) || ae.Class() != "budget_bytes" {
+				t.Fatalf("%s j=%d: err = %v, want budget_bytes", kind, j, err)
+			}
+			if ae.Offset != want {
+				t.Fatalf("%s j=%d: Offset = %d, want absolute site %d", kind, j, ae.Offset, want)
+			}
+			if ae.Offset <= prev {
+				t.Fatalf("%s: offset %d at j=%d not increasing (prev %d)", kind, ae.Offset, j, prev)
+			}
+			prev = ae.Offset
+		}
+	}
+}
+
+// PB7 — a single PRESENT string advertising 9 MB over MaxBytes=8 MB is
+// rejected by budget pre-read: only a sliver of the body exists, so a
+// body-consuming read would surface truncated instead of budget_bytes
+// before it.
+func TestBudgetPB7PreReadStringGuard(t *testing.T) {
+	c := newCraft()
+	c.descPos(dString)
+	c.tokenArg(0x6, 9<<20)
+	c.buf = append(c.buf, bytes.Repeat([]byte{0x61}, 1<<10)...)
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	dec.SetLimits(gbon.Limits{MaxBytes: 8 << 20})
+	var s string
+	err := dec.Decode(&s)
+	var ae *gbon.Error
+	if !errors.As(err, &ae) || ae.Class() != "budget_bytes" || !errors.Is(err, gbon.ErrBudget) {
+		t.Fatalf("Decode: err = %v, want pre-read budget_bytes (not a body-consuming truncated)", err)
+	}
+}
+
+// pb7BigBox drives the bigint decode half against the REMAINING budget:
+// the 1.5 MB pad leaves ~0.5 MB; the 1.5 MB advertised ext length is
+// under the full 2 MB budget but over the remainder.
+type pb7BigBox struct {
+	Pad string
+	B   *big.Int
+}
+
+// BIG-dec — a PRESENT bigint whose advertised ext length exceeds the
+// remaining per-value budget fails budget_bytes pre-read (the sliver
+// body makes a guard-less read surface truncated instead).
+func TestBudgetBIGDecExtPreRead(t *testing.T) {
+	c := newCraft()
+	c.descPos(dStructT(qn(pb7BigBox{}), cField{"Pad", dString}, cField{"B", dBigint}))
+	c.structTok()
+	c.strPos(strings.Repeat("p", 3<<19)) // 1.5 MB pad, within budget
+	c.buf = append(c.buf, 0x10)
+	c.arg(3 << 19) // 1.5 MB advertised ext: under the full budget, over the remainder
+	c.buf = append(c.buf, 0x01)
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	dec.SetLimits(gbon.Limits{MaxBytes: 2 << 20})
+	var box pb7BigBox
+	err := dec.Decode(&box)
+	var ae *gbon.Error
+	if !errors.As(err, &ae) || ae.Class() != "budget_bytes" || !errors.Is(err, gbon.ErrBudget) {
+		t.Fatalf("Decode: err = %v, want pre-read budget_bytes against the remaining budget", err)
+	}
+}
+
+// BND — the L==R / L==R+1 boundary table across the four charging
+// paths (string-decode, string-skip, bigint-decode, bigint-skip). R is
+// the maximal advertised length that still passes the whole path: the
+// wire guard admits it (L ≤ remaining) and the post-read check lands at
+// exactly the budget; L=R+1 passes the guard too but overdraws by the
+// token-arg byte and fails budget_bytes post-read.
+type bndStrBox struct{ S string }
+
+type bndStrGap struct{}
+
+type bndBigBox struct{ B *big.Int }
+
+type bndBigGap struct{}
+
+func bndStream(path string, overdraw int) (data []byte, R int) {
+	const budget = 2 << 20 // 2097152 bytes
+	c := newCraft()
+	writeBody := func(n int) {
+		c.buf = append(c.buf, bytes.Repeat([]byte{0xC2}, n)...)
+	}
+	// The first value's budget window starts at its record (the stream
+	// header is consumed before the budget decoder starts), so the spent
+	// share is the stream minus its 6-byte header.
+	switch path {
+	case "string-decode":
+		c.descPos(dStructT(qn(bndStrBox{}), cField{"S", dString}))
+		c.structTok()
+		R = int(budget) - (len(c.buf) - 6) - 5 // 5 = token arg at u32 form
+		c.tokenArg(0x6, uint64(R+overdraw))
+		writeBody(R + overdraw)
+	case "string-skip":
+		c.descPos(dStructT(qn(bndStrGap{}), cField{"S", dString}))
+		c.structTok()
+		R = int(budget) - (len(c.buf) - 6) - 5
+		c.tokenArg(0x6, uint64(R+overdraw))
+		writeBody(R + overdraw)
+	case "bigint-decode":
+		c.descPos(dStructT(qn(bndBigBox{}), cField{"B", dBigint}))
+		c.structTok()
+		R = int(budget) - (len(c.buf) - 6) - 6 // 0x10 selector + u32 length arg
+		c.buf = append(c.buf, 0x10)
+		c.arg(uint64(R + overdraw))
+		writeBody(R + overdraw)
+	case "bigint-skip":
+		c.descPos(dStructT(qn(bndBigGap{}), cField{"B", dBigint}))
+		c.structTok()
+		R = int(budget) - (len(c.buf) - 6) - 6
+		c.buf = append(c.buf, 0x10)
+		c.arg(uint64(R + overdraw))
+		writeBody(R + overdraw)
+	}
+	return c.buf, R
+}
+
+func TestBudgetBNDTable(t *testing.T) {
+	targets := map[string]func() any{
+		"string-decode": func() any { return new(bndStrBox) },
+		"string-skip":   func() any { return new(bndStrGap) },
+		"bigint-decode": func() any { return new(bndBigBox) },
+		"bigint-skip":   func() any { return new(bndBigGap) },
+	}
+	for _, path := range []string{"string-decode", "string-skip", "bigint-decode", "bigint-skip"} {
+		data, R := bndStream(path, 0)
+		dec := gbon.NewDecoder(bytes.NewReader(data))
+		dec.SetLimits(gbon.Limits{MaxBytes: 2 << 20})
+		if err := dec.Decode(targets[path]()); err != nil {
+			t.Fatalf("%s L==R: err = %v, want pass", path, err)
+		}
+		if path == "string-decode" {
+			var again bndStrBox
+			if err := gbon.Unmarshal(data, &again); err != nil || len(again.S) != R {
+				t.Fatalf("string-decode L==R value: err=%v len=%d want %d", err, len(again.S), R)
+			}
+		}
+		data2, _ := bndStream(path, 1)
+		dec2 := gbon.NewDecoder(bytes.NewReader(data2))
+		dec2.SetLimits(gbon.Limits{MaxBytes: 2 << 20})
+		err := dec2.Decode(targets[path]())
+		var ae *gbon.Error
+		if !errors.As(err, &ae) || ae.Class() != "budget_bytes" || !errors.Is(err, gbon.ErrBudget) {
+			t.Fatalf("%s L==R+1: err = %v, want budget_bytes", path, err)
+		}
+	}
+}
+
+// pa2Gap lacks the wire struct's string fields: every S field decodes
+// through the skip path (gap decode).
+type pa2Gap struct{}
+
+// PA2 — six SKIPPED 7 MB strings over MaxBytes=8 MB: the first skip
+// consumes its body within budget, the second's advertised length
+// exceeds the remaining share and fails budget_bytes pre-read (the
+// unbounded N×MaxBytes-per-record shape).
+func TestBudgetPA2SixSkippedStrings(t *testing.T) {
+	c := newCraft()
+	c.descPos(dStructT(qn(pa2Gap{}),
+		cField{"S1", dString}, cField{"S2", dString}, cField{"S3", dString},
+		cField{"S4", dString}, cField{"S5", dString}, cField{"S6", dString}))
+	c.structTok()
+	c.strPos(strings.Repeat("1", 7<<20)) // first body present, within budget
+	for range 5 {
+		c.tokenArg(0x6, 7<<20) // advertised only; S2 fails before any body
+	}
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	dec.SetLimits(gbon.Limits{MaxBytes: 8 << 20})
+	var gap pa2Gap
+	err := dec.Decode(&gap)
+	var ae *gbon.Error
+	if !errors.As(err, &ae) || ae.Class() != "budget_bytes" || !errors.Is(err, gbon.ErrBudget) {
+		t.Fatalf("Decode: err = %v, want budget_bytes pre-read on the second skip", err)
+	}
+}
+
+// PA1-ctl — a single SKIPPED 9 MB string over 8 MB still fails
+// budget_bytes: it fired via the full-budget guard before the tightening
+// and via the remaining bound after; the control pins the tightening not
+// losing it.
+func TestBudgetPA1ControlSingleSkip(t *testing.T) {
+	c := newCraft()
+	c.descPos(dStructT(qn(pa2Gap{}), cField{"S", dString}))
+	c.structTok()
+	c.tokenArg(0x6, 9<<20)
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	dec.SetLimits(gbon.Limits{MaxBytes: 8 << 20})
+	var gap pa2Gap
+	err := dec.Decode(&gap)
+	var ae *gbon.Error
+	if !errors.As(err, &ae) || ae.Class() != "budget_bytes" || !errors.Is(err, gbon.ErrBudget) {
+		t.Fatalf("Decode: err = %v, want budget_bytes", err)
+	}
+}
+
+// bigSkipGap lacks the wire struct's bigint fields (skip path).
+type bigSkipGap struct{}
+
+// BIG-skip — six SKIPPED ext bigints, each just under the 8 MB budget:
+// the first skip consumes its 7 MB body within budget, the second's
+// advertised ext length exceeds the remaining share and fails
+// budget_bytes pre-read.
+func TestBudgetBIGSkipSixExt(t *testing.T) {
+	c := newCraft()
+	c.descPos(dStructT(qn(bigSkipGap{}),
+		cField{"B1", dBigint}, cField{"B2", dBigint}, cField{"B3", dBigint},
+		cField{"B4", dBigint}, cField{"B5", dBigint}, cField{"B6", dBigint}))
+	c.structTok()
+	c.buf = append(c.buf, 0x10)
+	c.arg(7 << 20)
+	c.buf = append(c.buf, bytes.Repeat([]byte{0xC2}, 7<<20)...) // first body present
+	for range 5 {
+		c.buf = append(c.buf, 0x10) // advertised only; B2 fails before any body
+		c.arg(7 << 20)
+	}
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	dec.SetLimits(gbon.Limits{MaxBytes: 8 << 20})
+	var gap bigSkipGap
+	err := dec.Decode(&gap)
+	var ae *gbon.Error
+	if !errors.As(err, &ae) || ae.Class() != "budget_bytes" || !errors.Is(err, gbon.ErrBudget) {
+		t.Fatalf("Decode: err = %v, want budget_bytes pre-read on the second skip", err)
+	}
+}
+
+// PC-scope — per-value budget scope, executable witness: four records
+// each consuming ~7.5 MB over MaxBytes=8 MB all decode — the counter
+// resets at each record, so cumulative consumption (~30 MB) beyond
+// MaxBytes across records is conformant documented behavior, and each
+// record's own consumption rides a >largeRead window reset.
+func TestBudgetPCScopePerValueReset(t *testing.T) {
+	const body = 7864320 // 7.5 MB per record
+	c := newCraft()
+	for i := range 4 {
+		c.descPos(dString)
+		c.strPos(strings.Repeat(string(rune('A'+i)), body))
+	}
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	dec.SetLimits(gbon.Limits{MaxBytes: 8 << 20})
+	for i := range 4 {
+		var s string
+		if err := dec.Decode(&s); err != nil {
+			t.Fatalf("record %d: %v (per-value scope must reset the counter)", i+1, err)
+		}
+		if len(s) != body {
+			t.Fatalf("record %d: len %d, want %d", i+1, len(s), body)
+		}
+	}
+}
+
+// KG3 (public API half) — peeked REF string positions (shared string,
+// re-REF'd across records) around >largeRead reads: the consumed
+// sequence stays correct across the window resets. Companion to the
+// wire-level TestKG3PeekAcrossDirectRead in internal/wire (the
+// pending-track arming half lives there; root-package tests cannot
+// import internal/wire).
+func TestBudgetKG3SharedRefAcrossLargeReads(t *testing.T) {
+	const body = 3 << 19 // 1.5 MB per record
+	shared := strings.Repeat("k", body)
+	c := newCraft()
+	c.descPos(dString)
+	c.strPos(shared) // record 1: literal (readDirect body)
+	c.descPos(dString)
+	c.strPos(shared) // record 2: REF (peeked before read)
+	c.descPos(dString)
+	c.strPos(shared) // record 3: REF again, after two resets
+	dec := gbon.NewDecoder(bytes.NewReader(c.buf))
+	for i := range 3 {
+		var s string
+		if err := dec.Decode(&s); err != nil {
+			t.Fatalf("record %d: %v", i+1, err)
+		}
+		if s != shared {
+			t.Fatalf("record %d: %d bytes, want the shared %d", i+1, len(s), body)
+		}
 	}
 }

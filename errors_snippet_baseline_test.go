@@ -1,5 +1,15 @@
 package gbon_test
 
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/gbon-format/gbon-go"
+)
+
 // Identity baseline of the error renders (materialization fixture): %v and
 // %+v of one crafted probe per error class, pinned as literals. The
 // materializer below regenerates this file when the baseline is empty;
@@ -678,4 +688,29 @@ var snippetIdentityBaseline = map[string][2]string{
 	"unstable_zero_float_key": {"gbon: unstable_zero_float_key at $[0]: map holds a zero float key of ambiguous stored sign",
 		"gbon: unstable_zero_float_key at $[0]: map holds a zero float key of ambiguous stored sign\n    class = unstable_zero_float_key\n    path = $[0]\n    cause = map holds a zero fl" +
 			"oat key of ambiguous stored sign"},
+}
+
+// Trusted-mode registry-miss render (additive row): the miss fixture
+// under SetTrustedInput(true) — the detail gains the missing
+// name literal, the one-line shape is otherwise identical.
+func TestSnippetTrustedUnknownName(t *testing.T) {
+	ub, err := gbon.Marshal(struct{ V any }{struct{ X int64 }{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := gbon.NewDecoder(bytes.NewReader(ub))
+	dec.SetTrustedInput(true)
+	var uv struct{ V any }
+	gerr := dec.Decode(&uv)
+	var ae *gbon.Error
+	if !errors.As(gerr, &ae) {
+		t.Fatalf("not As-recoverable: %v", gerr)
+	}
+	want := "gbon: unknown_name at $.V (offset 85): interface concrete type not registered: use Decoder.Register (missing name \"struct { X int64 }\")"
+	if ae.Error() != want {
+		t.Fatalf("trusted render:\n got %q\nwant %q", ae.Error(), want)
+	}
+	if v := fmt.Sprintf("%+v", ae); !strings.Contains(v, `(missing name "struct { X int64 }")`) {
+		t.Fatalf("trusted verbose render: %q", v)
+	}
 }

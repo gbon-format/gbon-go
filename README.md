@@ -139,8 +139,9 @@ keys (by dynamic type and value).
 
 ## Budgeted decoding
 
-Untrusted input is a first-class concern. Five per-decoder budgets
-bound a decode before any runaway resource is committed:
+Untrusted input is a first-class concern. Five budgets, configured per
+decoder and enforced per decoded value, bound a decode before any
+runaway resource is committed:
 
 ```go
 dec := gbon.NewDecoder(r)
@@ -210,6 +211,13 @@ Types implementing `BinaryMarshaler`/`BinaryUnmarshaler` or
 monotonic reading is dropped); its behavior across type evolution is
 covered in [Known limitations](#known-limitations).
 
+A `Reader` or `Writer` whose methods panic or block owns the failure:
+decode-side panics — including a caller-supplied `Reader` panicking in
+the first fills — are contained and classified (`budget_alloc` for the
+make/grow family, `internal_panic` otherwise), encode-side panics
+propagate to the caller and break the `Encoder` (a sticky error on
+reuse), and a blocking call is never interrupted.
+
 ## Interface values
 
 Concrete types behind `any` decode through a per-Decoder registry:
@@ -245,8 +253,9 @@ Design facts of the GBON wire format, independent of any measurement:
 - **Self-describing, versioned stream** — a versioned header and
   in-band type descriptors; unknown majors are rejected and minor
   bumps are additive.
-- **Bounded structure** — five per-decoder budgets charged before
-  allocation; crafted input yields an error, never a panic or a hang.
+- **Bounded structure** — five budgets, set on the decoder and charged
+  per value, checked before allocation; crafted input yields an error,
+  never a panic or a hang.
 - **Single-pass, streaming decode** — the decoder consumes its input
   incrementally through a sliding window holding one in-flight record;
   large streams decode without materializing the whole input.
@@ -320,7 +329,9 @@ raised limits maps to `budget_alloc`; any other panic decodes to
 `internal_panic` (`ErrInternal`) — an internal defect, not input —
 with the panic value in `Got` and a bounded stack through
 `Error.Stack()`. The encode side has no recover — a value that panics
-during encoding propagates the panic.
+during encoding propagates the panic. That panic breaks the `Encoder`:
+every later `Encode` returns the same sticky `internal_panic` error
+without writing — discard an `Encoder` that panicked mid-`Encode`.
 
 ## Wire format and versioning
 
@@ -355,7 +366,10 @@ Honest list. Bugs and scope limits, not marketing:
 2. **Cross-package type evolution** works through `RegisterAs`: bind
    both versions to a common wire name on the Encoder and Decoder.
    Without a binding, strict type-name matching applies (same package
-   path across builds).
+   path across builds). The binding is chain-scoped: one wire name
+   covers a single pointer chain, the two ends may bind it at different
+   levels of that chain (the value and pointer arg forms interoperate),
+   and a second name on the same chain rejects with ErrUnsupported.
 3. **Interface slots with basic Go types** (integers, floats, bool,
    string, []byte) and basic composites ([]any, map[string]any,
    []string, []int64, map[string]string) decode through the stateless
@@ -393,6 +407,10 @@ Honest list. Bugs and scope limits, not marketing:
 10. **Encode/decode default-budget scissors.** Encoding defaults exceed
     decoding defaults; values encoded at defaults may need `SetLimits`
     on the decoding side.
+11. **Evolution narrowing over aliased records.** An evolution pair
+    whose kept field resolves a REF or view to an aliased record the
+    narrower target skipped (a shared map or shared backing) rejects
+    loud with `bad_ref` — the skipped record stays unmaterialized.
 
 Concurrency: `Marshal`/`Unmarshal` are safe for concurrent use; a
 single `Encoder` or `Decoder` is owned by one goroutine.

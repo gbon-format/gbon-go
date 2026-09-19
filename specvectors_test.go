@@ -35,7 +35,11 @@ type corpusVector struct {
 	Deriv     []string       `json:"deriv"`
 	Class     string         `json:"class"`
 	Limits    map[string]int `json:"limits"`
-	rawIR     map[string]any
+	// Narrowing channel of negative vectors only: the declared target
+	// binding and the expected absolute offset of the reject.
+	NarrowTarget string `json:"narrow_target,omitempty"`
+	NarrowOffset int    `json:"narrow_offset,omitempty"`
+	rawIR        map[string]any
 }
 
 type corpusFile struct {
@@ -134,6 +138,9 @@ type vecGrainWin struct {
 	W []int64
 	P *[3]int64
 }
+type vecMapShare2 struct{ F2 map[string]int64 }
+type vecViewShare2 struct{ W []int64 }
+type vecWrongSort2 struct{ M map[string]int64 }
 
 var corpusBindings = []struct {
 	name string
@@ -176,6 +183,9 @@ var corpusBindings = []struct {
 	{"vec.aliased", vecAliased{}},
 	{"vec.appended", vecAppended{}},
 	{"vec.grain", vecGrainWin{}},
+	{"vec.mapshare", vecMapShare2{}},
+	{"vec.viewshare", vecViewShare2{}},
+	{"vec.wrongsort", vecWrongSort2{}},
 	{"map[string]vec.aliased", map[string]vecAliased{}},
 	{"map[string]vec.appended", map[string]vecAppended{}},
 	{"map[string]vec.grain", map[string]vecGrainWin{}},
@@ -1537,6 +1547,10 @@ func renumberIR(ir map[string]any) map[string]any {
 func runNegativeVector(t *testing.T, v *corpusVector, data []byte, sentinel error) {
 	dv := newCorpusDecoder(data)
 	dv.SetLimits(corpusLimits(v))
+	if v.NarrowTarget != "" {
+		runNarrowNegativeVector(t, v, dv, sentinel)
+		return
+	}
 	var target any
 	err := dv.Decode(&target)
 	if err == nil {
@@ -1553,6 +1567,41 @@ func runNegativeVector(t *testing.T, v *corpusVector, data []byte, sentinel erro
 	// truncated-input atomicity spot check: target stays zero
 	if target != nil {
 		t.Fatalf("partial value exposed on failed decode")
+	}
+}
+
+// runNarrowNegativeVector decodes into the vector's declared narrow
+// target: the reject fires at the kept position resolving a record the
+// skipped prefix left unmaterialized; class and offset assert.
+func runNarrowNegativeVector(t *testing.T, v *corpusVector, dv *gbon.Decoder, sentinel error) {
+	t.Helper()
+	var ex any
+	for _, b := range corpusBindings {
+		if b.name == v.NarrowTarget {
+			ex = b.ex
+			break
+		}
+	}
+	if ex == nil {
+		t.Fatalf("narrow_target %q has no corpus binding", v.NarrowTarget)
+	}
+	tgt := reflect.New(reflect.TypeOf(ex)).Interface()
+	err := dv.Decode(tgt)
+	if err == nil {
+		t.Fatalf("negative vector decoded successfully into %s", v.NarrowTarget)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("want %v, got %v (class %q)", sentinel, err, errClass(err))
+	}
+	if c := errClass(err); c != v.Class {
+		t.Fatalf("class: want %q, got %q", v.Class, c)
+	}
+	se, ok := errors.AsType[*gbon.Error](err)
+	if !ok {
+		t.Fatalf("not a *gbon.Error: %v", err)
+	}
+	if se.Offset != v.NarrowOffset {
+		t.Fatalf("offset: want %d, got %d", v.NarrowOffset, se.Offset)
 	}
 }
 
