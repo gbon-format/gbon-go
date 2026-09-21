@@ -667,33 +667,38 @@ func multiBreach(kind string, j int) (data []byte, want int) {
 	}
 	switch kind {
 	case "present-string":
-		rec := len(c.buf)
 		c.descPos(dStructT(qn(multiPairBox{}), cField{"S1", dString}, cField{"S2", dString}))
+		start := len(c.buf)
 		c.structTok()
 		c.strPos(strings.Repeat("x", 3<<19))
-		rem := int(budget) - (len(c.buf) - rec)
+		rem := start + int(budget) + 1 - len(c.buf)
 		c.tokenArg(0x6, uint64(rem))
 		c.buf = append(c.buf, bytes.Repeat([]byte{0x79}, rem)...)
 		return c.buf, len(c.buf)
 	case "skipped-string":
-		rec := len(c.buf)
 		c.descPos(dStructT(qn(multiGapPairBox{}), cField{"S1", dString}, cField{"S2", dString}))
+		start := len(c.buf)
 		c.structTok()
 		c.strPos(strings.Repeat("x", 3<<19))
-		rem := int(budget) - (len(c.buf) - rec)
+		site := len(c.buf)
+		rem := start + int(budget) + 1 - len(c.buf)
 		c.tokenArg(0x6, uint64(rem))
 		c.buf = append(c.buf, bytes.Repeat([]byte{0x79}, rem)...)
-		return c.buf, len(c.buf)
+		// the skip path's budget check is pre-read: the reject fires
+		// just after the oversized token's first byte
+		return c.buf, site + 5
 	case "present-bigint":
 		c.descPos(dBigint)
 		c.buf = append(c.buf, 0x10)
-		c.arg(5 << 19)
+		c.arg(5 << 21)
+		// the ext-arg advertised length is budget-checked pre-read:
+		// the reject fires after the argument token
 		return c.buf, len(c.buf)
 	case "skipped-bigint":
 		c.descPos(dStructT(qn(multiGapBox{}), cField{"B", dBigint}))
 		c.structTok()
 		c.buf = append(c.buf, 0x10)
-		c.arg(5 << 19)
+		c.arg(5 << 21)
 		return c.buf, len(c.buf)
 	case "blob":
 		c.descPos(dBlob)
@@ -706,8 +711,10 @@ func multiBreach(kind string, j int) (data []byte, want int) {
 
 // MULTI — for every breach position j∈{1..4} and field kind, the
 // budget error's offset equals its constructed absolute site, and the
-// sites strictly increase with j (per-value windows over a compacting
-// multi-record stream).
+// sites strictly increase with j. Per-value budget scope — each
+// record's counter opens at the value start (after the root
+// descriptor) — a record breaches on its own consumption alone, no
+// per-stream cumulative cap.
 func TestBudgetMULTIAbsoluteOffsets(t *testing.T) {
 	targets := map[string]func() any{
 		"present-string": func() any { return new(multiPairBox) },
@@ -812,33 +819,37 @@ func bndStream(path string, overdraw int) (data []byte, R int) {
 	writeBody := func(n int) {
 		c.buf = append(c.buf, bytes.Repeat([]byte{0xC2}, n)...)
 	}
-	// The first value's budget window starts at its record (the stream
-	// header is consumed before the budget decoder starts), so the spent
-	// share is the stream minus its 6-byte header.
+	// Per-value budget scope — the window opens at the value's
+	// start — after the root descriptor — so the spent share is the
+	// stream from that boundary, not from the stream header.
 	switch path {
 	case "string-decode":
 		c.descPos(dStructT(qn(bndStrBox{}), cField{"S", dString}))
+		start := len(c.buf)
 		c.structTok()
-		R = int(budget) - (len(c.buf) - 6) - 5 // 5 = token arg at u32 form
+		R = int(budget) - (len(c.buf) - start) - 5 // 5 = token arg at u32 form
 		c.tokenArg(0x6, uint64(R+overdraw))
 		writeBody(R + overdraw)
 	case "string-skip":
 		c.descPos(dStructT(qn(bndStrGap{}), cField{"S", dString}))
+		start := len(c.buf)
 		c.structTok()
-		R = int(budget) - (len(c.buf) - 6) - 5
+		R = int(budget) - (len(c.buf) - start) - 5
 		c.tokenArg(0x6, uint64(R+overdraw))
 		writeBody(R + overdraw)
 	case "bigint-decode":
 		c.descPos(dStructT(qn(bndBigBox{}), cField{"B", dBigint}))
+		start := len(c.buf)
 		c.structTok()
-		R = int(budget) - (len(c.buf) - 6) - 6 // 0x10 selector + u32 length arg
+		R = int(budget) - (len(c.buf) - start) - 6 // 0x10 selector + u32 length arg
 		c.buf = append(c.buf, 0x10)
 		c.arg(uint64(R + overdraw))
 		writeBody(R + overdraw)
 	case "bigint-skip":
 		c.descPos(dStructT(qn(bndBigGap{}), cField{"B", dBigint}))
+		start := len(c.buf)
 		c.structTok()
-		R = int(budget) - (len(c.buf) - 6) - 6
+		R = int(budget) - (len(c.buf) - start) - 6
 		c.buf = append(c.buf, 0x10)
 		c.arg(uint64(R + overdraw))
 		writeBody(R + overdraw)

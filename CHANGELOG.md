@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Added
+
+- Interior-slot tracking bound: the encode pre-scan registers
+  addressable interior slots up to `slotPopMax` (4,194,304) per
+  value; beyond the bound per-slot registration stops and excess
+  interior pointers encode as value copies (wires stay valid and
+  byte-stable). Lazy weak handles for forcing keep factory-scale
+  shared-container graphs linear.
+- Positional-path references — the format 0.2 amendment
+  (wire-format.md 7.2): interior slots — struct fields, nested
+  value-struct fields, slice- and array-element interiors,
+  blob-element interiors — carry
+  identity through a REF path argument (marker/terminator framing
+  from the reserved selectors, field steps naming fields through the
+  intern space, element steps over backing records); positions
+  derivable by the canonical descent keep the bare-REF form
+  (mandatory elision). The encoder pre-scan fixes path names and
+  record forcings — an untracked container addressed at an interior
+  opens as a record immediately before its first dependent carrier
+  in the canonical field order — and every stream header carries
+  minor 02 (the amendment rides the minor; a 0.1 decoder fails
+  loudly at the path marker, `malformed_op`). Decode is
+  container-first with the slot-storage invariant: the named
+  record's storage materializes before its interior handles bind,
+  and each slot's value is read exactly once, at its own token.
+- Error classes `bad_path` (data/format) and
+  `evolution_ref_unmaterialized` (data/format), additive.
+  `bad_path`: unresolvable or non-canonical path arguments —
+  zero-step paths, a path spelling the derivable descent, wrong
+  rooting (a step traversing a view, interface, or map-cell
+  position; element indices outside the backing's declared index
+  space), indices beyond the backing, out-of-family grains,
+  coder-backed steps, zero-size terminals.
+  `evolution_ref_unmaterialized`: the evolution-narrowing carve-out
+  — a kept REF or view resolving a record the skipped field left
+  unmaterialized rejects with its own class (previously a generic
+  `bad_ref`/`type_mismatch` rendering; without a skipped field the
+  same shape stays plain corruption, `bad_ref`).
+- Conformance leg for the amendment: 16 corpus vectors
+  (V-118..V-133; specification corpus 117 → 133) with per-vector
+  decode/parity oracles, path-grammar property tests, and fuzz
+  seeds over path-carrying streams.
+
+### Changed
+
+- Decoder budget accounting aligned to the per-value scope of
+  wire-format.md 9.1 (0.2): MaxBytes charges each value against the
+  absolute stream position — the whole-stream start anchor of the
+  earlier reading is gone.
+- scripts/gate.sh: the specification corpus resolves from
+  GBON_SPEC_SRC (with GBON_SPEC_VECTORS passthrough); the default
+  ../../spec mount is preserved, so the gate runs unchanged against
+  the legacy corpus and against the staged 133-vector corpus.
+
 ## [0.1.1] - 2026-09-19
 
 ### Fixed
@@ -227,7 +283,12 @@ faster, and long-lived streams hold far less memory.
   never panics, hangs, or surprise allocations.
 - Stdlib-only single module `gbon` (codec, `internal/wire`).
 
-[Unreleased]: https://github.com/gbon-format/gbon-go/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/gbon-format/gbon-go/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/gbon-format/gbon-go/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/gbon-format/gbon-go/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/gbon-format/gbon-go/compare/v0.0.5...v0.1.0
+[0.0.5]: https://github.com/gbon-format/gbon-go/compare/v0.0.4...v0.0.5
+[0.0.4]: https://github.com/gbon-format/gbon-go/compare/v0.0.3...v0.0.4
+[0.0.3]: https://github.com/gbon-format/gbon-go/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/gbon-format/gbon-go/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/gbon-format/gbon-go/releases/tag/v0.0.1

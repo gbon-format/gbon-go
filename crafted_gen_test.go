@@ -1094,8 +1094,11 @@ func TestCraftedSkippedMapRef(t *testing.T) {
 		t.Fatalf("err = %v, want ErrFormat", err)
 	}
 	var ae *gbon.Error
-	if !errors.As(err, &ae) || ae.Class() != "bad_ref" {
-		t.Fatalf("err = %v, want the not-materialized bad_ref class", err)
+	// the 0.2 amendment re-types the narrowing carve-out (0.2
+	// pattern): the not-materialized reject is
+	// evolution_ref_unmaterialized; the 0.1 class was bad_ref
+	if !errors.As(err, &ae) || (ae.Class() != "bad_ref" && ae.Class() != "evolution_ref_unmaterialized") {
+		t.Fatalf("err = %v, want the not-materialized class (bad_ref or its 0.2 re-typing)", err)
 	}
 }
 

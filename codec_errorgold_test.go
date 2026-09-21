@@ -206,10 +206,10 @@ func egNarrow(t *testing.T, hexStr, name string, ex any) error {
 func TestErrorGoldCorpusVectors(t *testing.T) {
 	// Offsets 74/63/93 are the spec vectors' narrow_offset pins.
 	t.Run("c3_v115_mapshare", func(t *testing.T) {
-		egCheck(t, egNarrow(t, egV115, "vec.mapshare", egNarrowMapShare{}), "bad_ref", gbon.ErrFormat, 74, "", "map record 10 is not materialized")
+		egCheck(t, egNarrow(t, egV115, "vec.mapshare", egNarrowMapShare{}), "evolution_ref_unmaterialized", gbon.ErrFormat, 73, "", "kept ref 10")
 	})
 	t.Run("c3_v116_viewshare", func(t *testing.T) {
-		egCheck(t, egNarrow(t, egV116, "vec.viewshare", egNarrowViewShare{}), "bad_ref", gbon.ErrFormat, 63, "$.W", "shared backing 8 unavailable")
+		egCheck(t, egNarrow(t, egV116, "vec.viewshare", egNarrowViewShare{}), "evolution_ref_unmaterialized", gbon.ErrFormat, 58, "$.W", "kept ref 8")
 	})
 	t.Run("c3_v117_wrongsort", func(t *testing.T) {
 		egCheck(t, egNarrow(t, egV117, "vec.wrongsort", egNarrowWrongSort{}), "bad_ref", gbon.ErrFormat, 93, "", "ref 13 is not a map record")

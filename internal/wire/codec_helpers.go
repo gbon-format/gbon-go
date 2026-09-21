@@ -36,6 +36,26 @@ func (w *Writer) ReserveID() uint64 { return w.allocID() }
 // NextID returns the id that the next allocation will take (peek).
 func (w *Writer) NextID() uint64 { return w.nextID }
 
+// StringID returns the intern id of a string already registered in the
+// writer's string table — the id a path field-step references.
+func (w *Writer) StringID(s string) (uint64, bool) {
+	id, ok := w.strs.get(s)
+	return id, ok
+}
+
+// appendArg renders one bare argument in minimal form.
+func appendArg(dst []byte, n uint64) []byte {
+	form := argForm(n)
+	dst = append(dst, form)
+	return appendArgBytes(dst, form, n)
+}
+
+// WriteBareArg writes one bare argument in minimal form — the
+// integer payload shape of path steps.
+func (w *Writer) WriteBareArg(n uint64) error {
+	return w.WriteRawBytes(appendArg(nil, n))
+}
+
 // WriteRawBytes appends raw record-body bytes (BLOB payload positions).
 func (w *Writer) WriteRawBytes(b []byte) error {
 	w.buf = append(w.buf, b...)
@@ -57,6 +77,58 @@ func (w *Writer) FlushTo(iw io.Writer) error {
 
 // ReadRawBytes consumes n raw record-body bytes (BLOB payload positions).
 func (r *Reader) ReadRawBytes(n uint64) ([]byte, error) { return r.readN(n) }
+
+// StringAt returns the interned string of a string record id:
+// the name a path field-step references.
+func (r *Reader) StringAt(id uint64) (string, error) {
+	k, err := r.kindAt(id)
+	if err != nil {
+		return "", err
+	}
+	if k != entryString {
+		return "", werr(kindBadRef, "wire: ref %d is not a string", id)
+	}
+	if id >= uint64(len(r.strs)) {
+		return "", werr(kindBadRef, "wire: string record %d missing", id)
+	}
+	return r.strs[id], nil
+}
+
+// PeekByte returns the next undecoded byte without consuming it.
+func (r *Reader) PeekByte() (byte, bool) {
+	if r.pos >= len(r.buf) {
+		return 0, false
+	}
+	return r.buf[r.pos], true
+}
+
+// PeekByteAfterRef returns the byte following the REF token at the read
+// position — the positional-path marker position (7.2) — without
+// consuming anything; the caller guarantees the next token is a REF.
+func (r *Reader) PeekByteAfterRef() (byte, bool) {
+	if r.pos >= len(r.buf) {
+		return 0, false
+	}
+	w := 1
+	switch form := r.buf[r.pos] & 0x0F; form {
+	case 0x0C:
+		w = 2
+	case 0x0D:
+		w = 3
+	case 0x0E:
+		w = 5
+	case 0x0F:
+		w = 9
+	default:
+		if form > 0x0B {
+			return 0, false
+		}
+	}
+	if r.pos+w >= len(r.buf) {
+		return 0, false
+	}
+	return r.buf[r.pos+w], true
+}
 
 // ByteRange returns the read-only input bytes in [start, end); the bounds
 // come from Pos() snapshots taken around token consumption (skip-path key
@@ -93,6 +165,23 @@ func (r *Reader) ValueAt(id uint64) (reflect.Value, error) {
 		return reflect.Value{}, werr(kindBadRef, "wire: ref %d is not an object record", id)
 	}
 	return r.vals[id], nil
+}
+
+// RecordExists reports whether id resolves in the intern space (a
+// registered record of any sort, materialized or skipped).
+func (r *Reader) RecordExists(id uint64) bool {
+	_, err := r.kindAt(id)
+	return err == nil
+}
+
+// MapRecordUnmaterialized reports whether id is a registered map record
+// with no materialized object — the narrowing-skip shape.
+func (r *Reader) MapRecordUnmaterialized(id uint64) bool {
+	k, err := r.kindAt(id)
+	if err != nil || k != entryMap {
+		return false
+	}
+	return !r.vals[id].IsValid()
 }
 
 // MapAt returns the map object registered for record id. The id must

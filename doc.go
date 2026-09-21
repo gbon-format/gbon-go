@@ -146,8 +146,10 @@
 //	overflow_value    data/format: value out of the target range
 //	duplicate_key     data/format: duplicate map key
 //	bad_ref           data/format: unresolvable or misused reference
+//	bad_path          data/format: positional path violates 7.2 (rooting, index, terminal, canonicality)
 //	bad_view          data/format: malformed view record
 //	type_mismatch     data/format: stream kind does not fit the target
+//	evolution_ref_unmaterialized data/format: kept REF resolves a record the narrowing skip left unmaterialized
 //	unknown_name      data/format: unregistered wire name
 //	budget_depth      budget: depth budget exhausted
 //	budget_nodes      budget: node budget exhausted

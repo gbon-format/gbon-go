@@ -227,6 +227,14 @@ type codecEncoder struct {
 	maps        map[uintptr]weakID
 	grains      map[uintptr]*grainRec // canonical-grain records by address
 	gscan       map[uintptr][]reflect.Type
+	inames      map[uintptr]*interiorName // tracked interior addresses → (record, path) names (7.2)
+	refInterior map[uintptr]bool          // interiors denoted by a referenced pointer cell (7.2 carve-out)
+	pathCells   map[uintptr]*grainRec     // explicit path cells by address (never clobber container records)
+	slotIdx     map[uintptr][]slotEntry   // slot address → candidate slots (same-address nesting is type-level)
+	slotPop     int                       // interior-slot registrations this value (slotPopMax bound)
+	contOf      map[contID]contEntry      // inline container → parent container + step (climb links)
+	containers  map[contID]contInfo       // container identity → type + live pointer
+	backRec     map[backKey]backingRec    // backing (base, element stride) → emitted ARRAY/BLOB record id + index-space origin
 	pendingRec  *grainRec
 	inserts     uint64 // intern insertions since the last dead-entry sweep
 	sweeps      uint64 // dead-entry sweeps executed this stream
@@ -714,15 +722,22 @@ func (e *codecEncoder) keyTracksIntern(kp *typePlan) bool {
 
 func newCodecEncoder() *codecEncoder {
 	e := &codecEncoder{
-		w:         wire.NewWriter(),
-		types:     make(map[reflect.Type]typeEntry),
-		maps:      make(map[uintptr]weakID),
-		grains:    make(map[uintptr]*grainRec),
-		gscan:     make(map[uintptr][]reflect.Type),
-		coderTags: make(map[reflect.Type]uint64),
-		classIx:   make(map[groupClass]*classIndex),
-		slotIx:    make(map[slotKey]int32),
-		hostCache: make(map[hostKey]int32),
+		w:           wire.NewWriter(),
+		types:       make(map[reflect.Type]typeEntry),
+		maps:        make(map[uintptr]weakID),
+		grains:      make(map[uintptr]*grainRec),
+		gscan:       make(map[uintptr][]reflect.Type),
+		inames:      make(map[uintptr]*interiorName),
+		refInterior: make(map[uintptr]bool),
+		pathCells:   make(map[uintptr]*grainRec),
+		slotIdx:     make(map[uintptr][]slotEntry),
+		contOf:      make(map[contID]contEntry),
+		containers:  make(map[contID]contInfo),
+		backRec:     make(map[backKey]backingRec),
+		coderTags:   make(map[reflect.Type]uint64),
+		classIx:     make(map[groupClass]*classIndex),
+		slotIx:      make(map[slotKey]int32),
+		hostCache:   make(map[hostKey]int32),
 	}
 	e.lim = effEncodeLimits(Limits{})
 	return e
@@ -1247,7 +1262,13 @@ func (e *codecEncoder) encodeSub(v any) error {
 	if err := e.grainScan(reflect.ValueOf(v), newVisitedSet(), e.planFor(reflect.TypeOf(v))); err != nil {
 		return err
 	}
-	return e.encodeValue(reflect.ValueOf(v), pathNode{idx: -1})
+	clear(e.inames)
+	e.buildInteriorNames()
+	err := e.encodeValue(reflect.ValueOf(v), pathNode{idx: -1})
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 var anyType = reflect.TypeFor[any]()
@@ -1265,7 +1286,7 @@ func codecMarshalStable(v any) ([]byte, error) {
 	e.resetForPool(nil)
 	e.stable = true
 	defer encoderPool.Put(e)
-	if err := e.w.WriteHeader(); err != nil {
+	if err := e.writeStreamHeader(); err != nil {
 		return nil, err
 	}
 	e.streamStart = len(e.w.Bytes())
@@ -1295,7 +1316,7 @@ func codecMarshalScoped(v any, src *codecEncoder) ([]byte, error) {
 	e := encoderPool.Get().(*codecEncoder)
 	e.resetForPool(src)
 	defer encoderPool.Put(e)
-	if err := e.w.WriteHeader(); err != nil {
+	if err := e.writeStreamHeader(); err != nil {
 		return nil, err
 	}
 	e.streamStart = len(e.w.Bytes())
@@ -1329,6 +1350,13 @@ func (e *codecEncoder) resetForPool(src *codecEncoder) {
 	clear(e.maps)
 	clear(e.grains)
 	clear(e.gscan)
+	clear(e.inames)
+	clear(e.refInterior)
+	clear(e.pathCells)
+	clear(e.slotIdx)
+	clear(e.contOf)
+	clear(e.containers)
+	clear(e.backRec)
 	e.hdrEp++
 	e.pendingRec = nil
 	e.inserts = 0
@@ -1384,9 +1412,17 @@ func (e *codecEncoder) encodeRoot(v any) error {
 		return err
 	}
 	clear(e.gscan)
+	clear(e.refInterior)
+	clear(e.slotIdx)
+	e.slotPop = 0
+	clear(e.contOf)
+	clear(e.containers)
+	clear(e.backRec)
 	if err := e.grainScan(reflect.ValueOf(v), newVisitedSet(), e.planFor(reflect.TypeOf(v))); err != nil {
 		return err
 	}
+	clear(e.inames)
+	e.buildInteriorNames()
 	return e.encodeValue(reflect.ValueOf(v), pathNode{idx: -1})
 }
 
@@ -1425,7 +1461,7 @@ func (e *codecEncoder) Encode(v any) error {
 		return nil
 	}
 	if !e.started {
-		if err := e.w.WriteHeader(); err != nil {
+		if err := e.writeStreamHeader(); err != nil {
 			return err
 		}
 		e.started = true
@@ -1587,6 +1623,14 @@ func (e *codecEncoder) encodeBodyInner(v reflect.Value, p pathNode) error {
 			return e.w.WriteNil(wire.NilInterface)
 		}
 		dv := v.Elem()
+		// a path-ref at interface grain carries no grain tag (7.2
+		// tagless): the dynamic pointer into an interior slot emits
+		// the bare path form, never a dynamic descriptor
+		if dv.Kind() == reflect.Pointer && !dv.IsNil() && dv.Type().Elem().Kind() != reflect.Interface {
+			if _, ok := e.inames[dv.Pointer()]; ok {
+				return e.encodeBody(dv, p)
+			}
+		}
 		if err := e.writeDescOf(dv.Type(), p); err != nil {
 			return err
 		}
@@ -2349,6 +2393,9 @@ func (e *codecEncoder) writeGroupRecord(ci int32, p pathNode) error {
 	if err := e.w.WriteArrayHeader(L, E); err != nil {
 		return err
 	}
+	for _, m := range a.compMembers(ci, a.mem) {
+		e.backRec[backKey{a.sPtr[m], uintptr(c.es)}] = backingRec{id: c.id, origin: uintptr(c.origin), es: uintptr(c.es)}
+	}
 	if primBatchKind(a.sElemT[c.head].Kind()) != reflect.Invalid {
 		return e.writeGroupElems(ci, E, p)
 	}
@@ -2552,6 +2599,9 @@ func (e *codecEncoder) encodeBlob(v reflect.Value, p pathNode) error {
 		e.markEmitted(ci)
 		c.id = e.w.NextID()
 		c.elided = E
+		for _, m := range a.compMembers(ci, a.mem) {
+			e.backRec[backKey{a.sPtr[m], uintptr(c.es)}] = backingRec{id: c.id, origin: uintptr(c.origin), es: uintptr(c.es)}
+		}
 		if err := e.w.WriteBlobHeader(L, E); err != nil {
 			return err
 		}
@@ -2568,6 +2618,7 @@ func (e *codecEncoder) encodeFreshBlob(v reflect.Value) error {
 	L := uint64(v.Cap())
 	E := denseBytes(b)
 	id := e.w.NextID()
+	e.backRec[backKey{v.Pointer(), 1}] = backingRec{id: id, origin: v.Pointer(), es: 1}
 	if err := e.w.WriteBlobHeader(L, E); err != nil {
 		return err
 	}
@@ -2638,6 +2689,7 @@ func (e *codecEncoder) encodeFreshSlice(v reflect.Value, p pathNode) error {
 	if err := e.w.WriteArrayHeader(L, E); err != nil {
 		return err
 	}
+	e.backRec[backKey{v.Pointer(), v.Type().Elem().Size()}] = backingRec{id: id, origin: v.Pointer(), es: v.Type().Elem().Size()}
 	if primBatchKind(v.Type().Elem().Kind()) != reflect.Invalid {
 		if err := e.writePrimElems(v, E, p); err != nil {
 			return err
@@ -2662,8 +2714,13 @@ func (e *codecEncoder) encodeFreshSlice(v reflect.Value, p pathNode) error {
 func (e *codecEncoder) encodeArray(v reflect.Value, p pathNode) error {
 	L := uint64(v.Len())
 	E := densePrefix(v)
+	id := e.w.NextID()
 	if err := e.w.WriteArrayHeader(L, E); err != nil {
 		return err
+	}
+	if v.CanAddr() {
+		base := v.Addr().Pointer()
+		e.backRec[backKey{base, v.Type().Elem().Size()}] = backingRec{id: id, origin: base, es: v.Type().Elem().Size()}
 	}
 	if primBatchKind(v.Type().Elem().Kind()) != reflect.Invalid {
 		return e.writePrimElems(v, E, p)
@@ -3757,6 +3814,373 @@ func grainDerivable(grain, target reflect.Type) bool {
 	return false
 }
 
+// pathStep is one descent step of an interior name: a descriptor field
+// name or a backing element index, with the slot's absolute address for
+// index arithmetic at emission.
+type pathStep struct {
+	name string
+	addr uintptr
+	base uintptr
+	es   uintptr
+	idx  uint64
+	elem bool
+}
+
+// contID is a container's identity: its storage base plus its type —
+// same-address nesting (arrays at offset zero) is type-level.
+type contID struct {
+	base uintptr
+	typ  reflect.Type
+}
+
+// slotEntry is one candidate reading of a slot address: the container
+// whose storage holds it, the canonical step that reaches it, and the
+// slot's declared type.
+type slotEntry struct {
+	cont  contID
+	step  pathStep
+	styp  reflect.Type
+	first bool
+}
+
+// contEntry is one climb link: a container occupying a slot of a parent
+// container.
+type contEntry struct {
+	parent contID
+	step   pathStep
+	styp   reflect.Type
+	first  bool
+}
+
+// contInfo carries a container's type and a weak handle to its storage
+// (forcing roots; the scan keeps no strong references).
+type contInfo struct {
+	typ reflect.Type
+}
+
+// interiorName is the (record, path) name of one tracked interior
+// address: the path root's storage plus the descent steps to the slot
+// (7.2). The root handle is weak — the pre-scan pins no value graph.
+type interiorName struct {
+	root     uintptr
+	rootType reflect.Type
+	termType reflect.Type
+	steps    []pathStep
+	deriv    bool // the path spells the derivable descent (elision candidate)
+	ownBase  bool // the slot coincides with its container's base (offset-0): only slot-grain positions take the name
+}
+
+// backingRec binds an emitted ARRAY record to its backing geometry: the
+// record id plus the component origin and element stride mapping slot
+// addresses onto the record's declared index space.
+type backingRec struct {
+	id     uint64
+	origin uintptr
+	es     uintptr
+}
+
+// backKey discriminates backing records sharing one storage base: a
+// nested inline array's element-0 sits at its owner's base, and the
+// owner's record and the nested record are distinct backings (7.2
+// rooting); the element stride separates them. Degenerate inner
+// length 1 ([N][1]T) shares the stride with its owner and stays a
+// loud bad_path reject on decode (element index beyond the backing).
+type backKey struct {
+	base uintptr
+	es   uintptr
+}
+
+// noteStructSlots records the addressable field slots of one struct
+// container in the slot index (scan pass); zero-size fields carry no
+// storage and stay unnamed. A struct-valued field also links the child
+// container into the climb index; an array-valued field stays a path
+// root (7.2 rooting).
+// slotPopMax bounds one stream's interior-slot registrations: the
+// per-field population is the pre-scan's dominant cost and exists only
+// to name tracked interior addresses, so past the bound containers and
+// climb links keep building while slot registration stops — graphs
+// without interior pointers (record-reference graphs at scale) lose
+// nothing; a graph whose interiors exceed the bound falls back to the
+// value-copy route for them.
+const slotPopMax = 1 << 22
+
+func (e *codecEncoder) noteStructSlots(v reflect.Value, pl *typePlan) {
+	t := v.Type()
+	base := v.Addr().Pointer()
+	id := contID{base, t}
+	if _, ok := e.containers[id]; ok {
+		return
+	}
+	e.containers[id] = contInfo{typ: t}
+	for i := range pl.fields {
+		f := &pl.fields[i]
+		st := t.Field(int(f.idx)).Type
+		if st.Size() == 0 {
+			continue
+		}
+		sa := base + f.off
+		entry := slotEntry{
+			cont:  id,
+			styp:  st,
+			first: f.off == 0,
+			step:  pathStep{name: f.name, addr: sa, base: base, es: st.Size()},
+		}
+		if e.slotPop < slotPopMax {
+			e.slotIdx[sa] = append(e.slotIdx[sa], entry)
+			e.slotPop++
+		}
+		fv := v.Field(int(f.idx))
+		if !fv.CanAddr() {
+			continue
+		}
+		switch st.Kind() {
+		case reflect.Struct:
+			e.contOf[contID{sa, st}] = contEntry{id, entry.step, st, entry.first}
+			e.noteStructSlots(fv, e.planFor(st))
+		case reflect.Array:
+			e.noteElemSlots(fv)
+		}
+	}
+}
+
+// noteElemSlots records the element slots of one backing container (a
+// slice's data span or an addressable array) in the slot index; struct
+// and array elements link their containers into the climb index (the
+// backing itself is always a path root).
+func (e *codecEncoder) noteElemSlots(v reflect.Value) {
+	var base uintptr
+	if v.Kind() == reflect.Slice {
+		base = v.Pointer()
+	} else if v.CanAddr() {
+		base = v.Addr().Pointer()
+	} else {
+		return
+	}
+	et := v.Type().Elem()
+	es := et.Size()
+	if es == 0 {
+		return
+	}
+	id := contID{base, v.Type()}
+	if _, ok := e.containers[id]; ok {
+		return
+	}
+	e.containers[id] = contInfo{typ: v.Type()}
+	for i := range v.Len() {
+		sa := base + uintptr(i)*es
+		entry := slotEntry{
+			cont:  id,
+			styp:  et,
+			first: i == 0,
+			step:  pathStep{addr: sa, base: base, es: es, idx: uint64(i), elem: true},
+		}
+		if e.slotPop < slotPopMax {
+			e.slotIdx[sa] = append(e.slotIdx[sa], entry)
+			e.slotPop++
+		}
+		ev := v.Index(i)
+		if !ev.CanAddr() {
+			continue
+		}
+		switch et.Kind() {
+		case reflect.Struct:
+			e.contOf[contID{sa, et}] = contEntry{id, entry.step, et, entry.first}
+			e.noteStructSlots(ev, e.planFor(et))
+		case reflect.Array:
+			e.contOf[contID{sa, et}] = contEntry{id, entry.step, et, entry.first}
+			e.noteElemSlots(ev)
+		case reflect.Slice:
+			// a slice element's own elements live in the element's
+			// separate backing, not this container's inline storage:
+			// the slots register for naming, but the climb stays
+			// unlinked — the inner slice's backing record is the path
+			// root (7.2 rooting)
+			e.noteElemSlots(ev)
+		}
+	}
+}
+
+// buildInteriorNames reduces the tracked addresses of the pre-scan to
+// (record, path) names: an address inside a container's inline storage
+// climbs to its path root — a tracked or forced struct, or a backing —
+// and takes that root plus the descent steps. A derivable descent
+// (leading fields, zero indices, no record-valued slot on the chain)
+// stays unnamed — the mandatory-elision bare REF of 7.2 rides the
+// pre-existing record route.
+func (e *codecEncoder) buildInteriorNames() {
+	for addr, entries := range e.slotIdx {
+		grains, tracked := e.gscan[addr]
+		if !tracked {
+			continue
+		}
+		// interface-typed terminals name like every other slot: the
+		// path-ref at interface grain over an interface-compatible
+		// terminal is legal grammar (7.2), and the slot-storage
+		// invariant binds the handle to the slot's storage
+		// an address tracked as its own container keeps the container's
+		// record: a slot coinciding with the container base (offset-0
+		// field) resolves through the record, not a name — unless the
+		// pointer is referenced: its cell needs the explicit name (7.2)
+		own := false
+		for _, g := range grains {
+			if _, ok := e.containers[contID{addr, g}]; ok {
+				own = true
+				break
+			}
+		}
+		ownYield := own && e.refInterior[addr]
+		if own && !ownYield {
+			continue
+		}
+		var sr *slotEntry
+		for i := range entries {
+			if entries[i].styp.Size() == 0 {
+				continue
+			}
+			for _, g := range grains {
+				if entries[i].styp == g {
+					sr = &entries[i]
+				}
+			}
+		}
+		if sr == nil {
+			continue
+		}
+		deriv := sr.first && kindTransparent(sr.styp)
+		steps := []pathStep{sr.step}
+		cur := sr.cont
+		for {
+			up, ok := e.contOf[cur]
+			if !ok {
+				break
+			}
+			steps = append(steps, up.step)
+			if !(up.first && kindTransparent(up.styp)) {
+				deriv = false
+			}
+			cur = up.parent
+		}
+		for i, j := 0, len(steps)-1; i < j; i, j = i+1, j-1 {
+			steps[i], steps[j] = steps[j], steps[i]
+		}
+		e.inames[addr] = &interiorName{
+			root:     cur.base,
+			rootType: e.containers[cur].typ,
+			termType: sr.styp,
+			steps:    steps,
+			deriv:    deriv,
+			ownBase:  ownYield,
+		}
+	}
+}
+
+// kindTransparent reports whether a slot of this type keeps a descent
+// chain derivable: containers with their own record identity (backings)
+// break the bare-REF elision boundary.
+func kindTransparent(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Array, reflect.Slice:
+		return false
+	}
+	return true
+}
+
+// encodePathRef writes a positional path reference (7.2): the REF of the
+// named record, the marker 05, the descent steps — a field by its
+// interned name id, an element by its minimal ARG index — and the
+// terminator 06. The pointer's own record is the cell carrying the path
+// body (double references REF it). Derivable positions never reach here
+// (mandatory elision).
+func (e *codecEncoder) encodePathRef(v reflect.Value, p pathNode, addr uintptr, elem reflect.Type, nm *interiorName) error {
+	if !grainCompatible(nm.termType, elem) {
+		return errUnsupported(classBadRef, p.String(), nm.termType, elem, errDetail("path terminal grain out of family for the position"))
+	}
+	var rootID uint64
+	var rootBr backingRec
+	var rootBrHit bool
+	if nm.rootType != nil && (nm.rootType.Kind() == reflect.Array || nm.rootType.Kind() == reflect.Slice) {
+		// the climb's terminal is a backing container (7.2 rooting):
+		// its root is its own ARRAY/BLOB record; the owner's grain may
+		// share the storage address at field offset 0, so grains never
+		// resolve a backing root. The key carries the container's
+		// element stride: a nested inline array at element-0 shares the
+		// owner's base but never its stride, keeping the owner's record
+		// and the nested record distinct backings.
+		rootBr, rootBrHit = e.backRec[backKey{nm.root, nm.rootType.Elem().Size()}]
+		if !rootBrHit {
+			return errUnsupported(classBadRef, p.String(), nil, nil, errDetail("path root record not open before its dependent carrier"))
+		}
+		rootID = rootBr.id
+	} else if rec, hit := e.grains[nm.root]; hit && rec.wp.Value() != nil {
+		rootID = rec.id
+	} else if nm.rootType != nil && nm.rootType.Kind() == reflect.Struct {
+		if _, tracked := e.gscan[nm.root]; !tracked {
+			// record forcing (7.2): an untracked container whose interior
+			// address is tracked opens its record immediately before its
+			// first dependent carrier; the body stays at the container's
+			// own position
+			up := (*byte)(unsafe.Add(unsafe.Pointer(nil), nm.root))
+			rec := &grainRec{grain: nm.rootType, wp: weak.Make[byte](up)}
+			rec.id = e.w.ReserveID()
+			rec.open = true
+			e.grains[nm.root] = rec
+			e.noteInternInsert()
+			rootID = rec.id
+		} else {
+			return errUnsupported(classBadRef, p.String(), nm.rootType, nil, errDetail("path root record not open before its dependent carrier"))
+		}
+	} else {
+		return errUnsupported(classBadRef, p.String(), nil, nil, errDetail("path root record not open before its dependent carrier"))
+	}
+	rec := &grainRec{grain: elem, wp: weak.Make[byte]((*byte)(v.UnsafePointer()))}
+	rec.id = e.w.ReserveID()
+	rec.open = true
+	e.pathCells[addr] = rec
+	e.noteInternInsert()
+	if err := e.w.WriteRef(rootID); err != nil {
+		return err
+	}
+	if err := e.w.WriteRawBytes([]byte{0x05}); err != nil {
+		return err
+	}
+	for i := range nm.steps {
+		st := &nm.steps[i]
+		if st.elem {
+			idx := st.idx
+			if i == 0 && rootBrHit && rootBr.origin != st.base {
+				if rootBr.es == 0 || st.addr < rootBr.origin || (st.addr-rootBr.origin)%rootBr.es != 0 {
+					return errFormat(classBadRef, -1, p.String(), nil, nil, errDetail("path element step outside the backing's declared index space"))
+				}
+				idx = uint64((st.addr - rootBr.origin) / rootBr.es)
+			}
+			if err := e.w.WriteRawBytes([]byte{0x01}); err != nil {
+				return err
+			}
+			if err := e.w.WriteBareArg(idx); err != nil {
+				return err
+			}
+			continue
+		}
+		id, ok := e.w.StringID(st.name)
+		if !ok {
+			return errFormat(classBadRef, -1, p.String(), nil, nil, errDetail("path field name not interned"))
+		}
+		if err := e.w.WriteRawBytes([]byte{0x00}); err != nil {
+			return err
+		}
+		if err := e.w.WriteBareArg(id); err != nil {
+			return err
+		}
+	}
+	return e.w.WriteRawBytes([]byte{0x06})
+}
+
+// writeStreamHeader emits the stream header at the encoder's minor: 0x02
+// carries the positional-path amendment — written always.
+func (e *codecEncoder) writeStreamHeader() error {
+	return e.w.WriteRawBytes([]byte{wire.Magic[0], wire.Magic[1], wire.Magic[2], wire.Magic[3], wire.Major, 0x02})
+}
+
 // grainScan walks the root's reference graph and accumulates the tracked
 // grain set of every address: one entry per pointer position whose
 // pointee is non-zero-size. Descent stops at repeated pointee or map
@@ -3780,6 +4204,7 @@ func (e *codecEncoder) grainScanInner(v reflect.Value, visited *visitedSet, pl *
 		if v.IsNil() {
 			return nil
 		}
+		e.noteElemSlots(v)
 		if e.visitHdr(hdrKey{ptr: v.Pointer(), len: v.Len(), cap: v.Cap()}) {
 			return nil
 		}
@@ -3791,6 +4216,9 @@ func (e *codecEncoder) grainScanInner(v reflect.Value, visited *visitedSet, pl *
 			}
 		}
 	case opArray:
+		if v.CanAddr() {
+			e.noteElemSlots(v)
+		}
 		if pl.elemScan {
 			for i := 0; i < v.Len(); i++ {
 				if err := e.grainScan(v.Index(i), visited, pl.elem); err != nil {
@@ -3799,6 +4227,9 @@ func (e *codecEncoder) grainScanInner(v reflect.Value, visited *visitedSet, pl *
 			}
 		}
 	case opStruct:
+		if v.CanAddr() {
+			e.noteStructSlots(v, pl)
+		}
 		for i := range pl.scanFields {
 			f := &pl.scanFields[i]
 			if err := e.grainScan(v.Field(int(f.idx)), visited, f.plan); err != nil {
@@ -3825,6 +4256,13 @@ func (e *codecEncoder) grainScanInner(v reflect.Value, visited *visitedSet, pl *
 		if !v.IsNil() && !pl.elemZero {
 			addr := v.Pointer()
 			e.gscan[addr] = append(e.gscan[addr], v.Type().Elem())
+			// a pointer-to-pointer marks its pointee's target as a
+			// referenced interior: the cell denoting that pointer is
+			// REF-able, so the elision rule yields to the explicit
+			// path form (7.2 double reference)
+			if inner := v.Elem(); inner.Kind() == reflect.Pointer && !inner.IsNil() && !pl.elemZero {
+				e.refInterior[inner.Pointer()] = true
+			}
 			if visited.visitScalar(addr) {
 				return nil
 			}
@@ -3892,6 +4330,49 @@ func (e *codecEncoder) encodePointer(v reflect.Value, p pathNode) error {
 		return e.w.WriteNil(wire.NilZeroSize)
 	}
 	addr := v.Pointer()
+	// a double pointer whose pointee's path cell is open names that
+	// cell: the tagless repeat of a referenced interior pointer (7.2)
+	if elem.Kind() == reflect.Pointer {
+		if inner := v.Elem(); inner.Kind() == reflect.Pointer && !inner.IsNil() {
+			if rec, hit := e.pathCells[inner.Pointer()]; hit && rec.wp.Value() != nil {
+				if !rec.open {
+					return errFormat(classBadRef, -1, p.String(), nil, nil, errDetail("ref to a record whose body has not started"))
+				}
+				return e.w.WriteRef(rec.id)
+			}
+		}
+	}
+	if nm, ok := e.inames[addr]; ok {
+		// mandatory elision governs pointer positions: a derivable,
+		// unreferenced pointer takes the pre-existing bare-REF route;
+		// a referenced one materializes the explicit cell (7.2
+		// carve-out). An own-base name serves only slot-grain
+		// positions — the container-grain pointer keeps the record
+		// route (the offset-0 coincidence).
+		if nm.ownBase && elem == nm.rootType {
+			// fall through to the record route
+		} else if !nm.deriv || e.refInterior[addr] {
+			// a referenced interior pointer materializes the explicit
+			// cell even when the container's record is already open at
+			// the same address (the offset-0 coincidence): the repeat
+			// REF would name the container, never the slot's cell
+			if rec, hit := e.pathCells[addr]; hit && rec.wp.Value() != nil {
+				if !rec.open {
+					return errFormat(classBadRef, -1, p.String(), nil, nil, errDetail("ref to a record whose body has not started"))
+				}
+				return e.w.WriteRef(rec.id)
+			}
+			if !e.refInterior[addr] {
+				if rec, hit := e.grains[addr]; hit && rec.wp.Value() != nil {
+					if !rec.open {
+						return errFormat(classBadRef, -1, p.String(), nil, nil, errDetail("ref to a record whose body has not started"))
+					}
+					return e.w.WriteRef(rec.id)
+				}
+			}
+			return e.encodePathRef(v, p, addr, elem, nm)
+		}
+	}
 	if rec, hit := e.grains[addr]; hit {
 		if rec.wp.Value() != nil {
 			if !rec.open {

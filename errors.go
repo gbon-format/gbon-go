@@ -50,8 +50,10 @@ const (
 	classOverflowValue        = "overflow_value"
 	classDuplicateKey         = "duplicate_key"
 	classBadRef               = "bad_ref"
+	classBadPath              = "bad_path"
 	classBadView              = "bad_view"
 	classTypeMismatch         = "type_mismatch"
+	classEvolutionRefUnmat    = "evolution_ref_unmaterialized"
 	classUnknownName          = "unknown_name"
 	classBudgetDepth          = "budget_depth"
 	classBudgetNodes          = "budget_nodes"
@@ -82,8 +84,10 @@ var classSentinels = map[string]error{
 	classOverflowValue:        ErrFormat,
 	classDuplicateKey:         ErrFormat,
 	classBadRef:               ErrFormat,
+	classBadPath:              ErrFormat,
 	classBadView:              ErrFormat,
 	classTypeMismatch:         ErrFormat,
+	classEvolutionRefUnmat:    ErrFormat,
 	classUnknownName:          ErrFormat,
 	classBudgetDepth:          ErrBudget,
 	classBudgetNodes:          ErrBudget,

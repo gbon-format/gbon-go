@@ -10,8 +10,10 @@ THRESHOLD=80
 MEMCAP=4g
 
 # Conformance corpus mount (spec repository checkout beside this repo);
-# absent directory keeps the gate runnable standalone.
-SPEC_SRC="$(cd "$(dirname "$0")/../../spec" 2>/dev/null && pwd)"
+# absent directory keeps the gate runnable standalone. GBON_SPEC_SRC
+# overrides the corpus source (e.g. the staged 0.2 worktree); the
+# default keeps the legacy corpus mount.
+SPEC_SRC="${GBON_SPEC_SRC:-$(cd "$(dirname "$0")/../../spec" 2>/dev/null && pwd)}"
 MOUNT=""
 [ -n "$SPEC_SRC" ] && MOUNT="-v $SPEC_SRC:/spec:ro"
 
@@ -43,6 +45,7 @@ docker run --rm \
   -v gbon-gosumdb:/go/pkg/sumdb \
   -v gbon-gocache:/gocache \
   -e THRESHOLD="$THRESHOLD" \
+  -e GBON_SPEC_VECTORS="${GBON_SPEC_VECTORS:-}" \
   -e GOCACHE=/gocache \
   -e GOLANGCI_LINT_CACHE=/gocache/golangci-lint \
   -w /w \

@@ -982,7 +982,7 @@ func TestMultiValueNoSharingByteStable(t *testing.T) {
 	// value-2: type REF(id0) + fresh BLOB (id3) + view — the per-value
 	// record bytes of a standalone Marshal, ids shifted by the stream.
 	w, err := hex.DecodeString(strings.ReplaceAll(
-		"67626F6E0001 DC0D665B5D62797465 720201029002 C0720203049003", " ", ""))
+		"67626F6E0002 DC0D665B5D62797465 720201029002 C0720203049003", " ", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -992,7 +992,7 @@ func TestMultiValueNoSharingByteStable(t *testing.T) {
 	// Primitives: value-2 body is the bare token, only the type position
 	// turns into the stream's REF.
 	stream = encodeStream(t, 5, 6)
-	w2, _ := hex.DecodeString(strings.ReplaceAll("67626F6E0001 D863696E7408 2A C02C0C", " ", ""))
+	w2, _ := hex.DecodeString(strings.ReplaceAll("67626F6E0002 D863696E7408 2A C02C0C", " ", ""))
 	if !bytes.Equal(stream, w2) {
 		t.Fatalf("primitive stream:\n got  % x\n want % x", stream, w2)
 	}

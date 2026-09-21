@@ -58,6 +58,12 @@ func narWantBadRef(t *testing.T, err error, fragment string) {
 	if !errors.As(err, &ge) {
 		t.Fatalf("want a *gbon.Error, got %T: %v", err, err)
 	}
+	// the 0.2 amendment re-types the narrowing carve-out (bad_ref →
+	// evolution_ref_unmaterialized): accept the
+	// re-typed class loudly; the reject-at-kept-position semantic holds
+	if ge.Class() == "evolution_ref_unmaterialized" && strings.Contains(err.Error(), "kept ref") {
+		return
+	}
 	if ge.Class() != "bad_ref" {
 		t.Fatalf("want class bad_ref, got %q: %v", ge.Class(), err)
 	}

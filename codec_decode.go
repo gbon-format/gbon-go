@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -87,10 +86,14 @@ type codecDecoder struct {
 	nodes      int
 	maxPairs   uint64
 	maxBytes   int
-	start      int        // stream offset where the current value began (MaxBytes)
-	alloc      int        // charged backing-allocation bytes (derived, booked via chargeAlloc)
-	broken     error      // sticky error of facade sub-decodes inside coder bodies
-	shr        *decShared // per-Reader caches: struct plans, coder memo, staging scratch
+	start      int               // stream offset where the current value began (MaxBytes)
+	minor      uint8             // stream minor version: path markers are 0.2 grammar
+	narrowed   bool              // a struct field was skipped: the local type is narrower than the stream
+	derivCell  *derivCellPending // derivable-spelled path cell: legal only if a repeat REF names it (7.2 carve-out)
+	cellDepth  int               // open standalone pointer-cell bodies: a cell body's derivable path is legal as-is (7.2 double reference)
+	alloc      int               // charged backing-allocation bytes (derived, booked via chargeAlloc)
+	broken     error             // sticky error of facade sub-decodes inside coder bodies
+	shr        *decShared        // per-Reader caches: struct plans, coder memo, staging scratch
 }
 
 // decShared is the per-Reader decode cache set: compiled struct plans
@@ -356,6 +359,7 @@ func codecUnmarshal(data []byte, v any) (err error) {
 		return d.mapErr(err)
 	} else {
 		d.legacy = minor == 0
+		d.minor = minor
 	}
 	desc, err := d.r.ReadDesc()
 	if err != nil {
@@ -365,25 +369,36 @@ func codecUnmarshal(data []byte, v any) (err error) {
 	if err != nil {
 		return err
 	}
+	// per-value budget scope — the counter opens at the value's
+	// start — after the root descriptor
+	d.start = d.r.Pos()
 	d.noteGrainUniverse(target.Type())
 	if rootDerefApplies(pd, target) {
-		return d.decodeRootPointer(pd, target, func(f func()) { rootRestore = f })
+		if err := d.decodeRootPointer(pd, target, func(f func()) { rootRestore = f }); err != nil {
+			return err
+		}
+		return d.checkDerivCell()
 	}
 	if err := matchRootDesc(desc, target.Type(), nil); err != nil {
 		gapped, gerr := d.decodeRootGap(pd, target, nil)
 		if gapped {
+			if gerr == nil {
+				return d.checkDerivCell()
+			}
 			return gerr
 		}
 		return d.fail(withOffset(err, int(d.r.Pos())))
 	}
-	// Root staging (decode atomicity): the whole value decodes into a
-	// codec-owned copy; the single target.Set on success is the commit
-	// point of the call — on any error the target keeps its pre-call state.
-	tmp := reflect.New(target.Type()).Elem()
-	if err := d.decodeBody(desc, tmp, pathNode{idx: -1}); err != nil {
+	// Root in-place decode with snapshot rollback (decode atomicity):
+	// fields materialize directly in the caller's storage — interior
+	// handles bind slot storage (7.2) — and any error restores the
+	// pre-call state through the root restore hook.
+	snap := reflect.New(target.Type()).Elem()
+	snap.Set(target)
+	rootRestore = func() { target.Set(snap) }
+	if err := d.decodeBody(desc, target, pathNode{idx: -1}); err != nil {
 		return d.fail(withOffset(err, int(d.r.Pos())))
 	}
-	target.Set(tmp)
 	return nil
 }
 
@@ -739,6 +754,7 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 	}
 	dec = newBudgetDecoder(d.r, eff, d.reg, d.coders, d.binds, d.fac, d.shared, d.asName, d.shr)
 	dec.legacy = d.minor == 0
+	dec.minor = d.minor
 	desc, err := d.r.ReadDesc()
 	if err != nil {
 		d.broken = dec.mapErr(err)
@@ -749,8 +765,15 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 		d.broken = err
 		return err
 	}
+	// per-value budget scope — the counter opens at the value's
+	// start — after the root descriptor — and resets at the next value
+	dec.start = dec.r.Pos()
 	if rootDerefApplies(pd, target) {
 		if err := dec.decodeRootPointer(pd, target, func(f func()) { rootRestore = f }); err != nil {
+			d.broken = err
+			return err
+		}
+		if err := dec.checkDerivCell(); err != nil {
 			d.broken = err
 			return err
 		}
@@ -765,6 +788,10 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 				d.broken = gerr
 				return gerr
 			}
+			if err := dec.checkDerivCell(); err != nil {
+				d.broken = err
+				return err
+			}
 			d.sawValue = true
 			d.r.Discard()
 			return nil
@@ -773,14 +800,21 @@ func (d *codecStreamDecoder) Decode(v any, l Limits) (err error) {
 		d.broken = err
 		return err
 	}
-	// Root staging (decode atomicity): one commit-point target.Set on
-	// success; on any error the target keeps its pre-call state.
-	tmp := reflect.New(target.Type()).Elem()
-	if err := dec.decodeBody(desc, tmp, pathNode{idx: -1}); err != nil {
+	// Root in-place decode with snapshot rollback (decode atomicity):
+	// fields materialize directly in the caller's storage — interior
+	// handles bind slot storage (7.2) — and any error restores the
+	// pre-call state through the root restore hook.
+	snap := reflect.New(target.Type()).Elem()
+	snap.Set(target)
+	rootRestore = func() { target.Set(snap) }
+	if err := dec.decodeBody(desc, target, pathNode{idx: -1}); err != nil {
 		d.broken = err
 		return err
 	}
-	target.Set(tmp)
+	if err := dec.checkDerivCell(); err != nil {
+		d.broken = err
+		return err
+	}
 	d.sawValue = true
 	d.r.Discard()
 	return nil
@@ -1015,6 +1049,20 @@ func (d *codecDecoder) decodeCoder(desc *wire.Desc, target reflect.Value, p path
 	if tc == nil {
 		return d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), desc.Name, nil, errDetail("no coder: use Decoder.RegisterCoder")))
 	}
+	// a leading nil selector on a coder-typed position is the zero
+	// value of the coded type: the coder body is absent (the 0.2
+	// crafted-negative surface; no v0.1.1 encoder emits it)
+	if d.r.IsNextNil() {
+		k, err := d.r.ReadNil()
+		if err != nil {
+			return d.mapErr(err)
+		}
+		if k != wire.NilPointer {
+			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("nil selector %d for coder position", k))))
+		}
+		target.Set(reflect.Zero(target.Type()))
+		return nil
+	}
 	if tc.ck == ckBigint && desc.Kind == wire.KindCoder {
 		// Kind-14 "big.Int" streams: the adapter STRING body stays
 		// accepted on decode; dispatch is by descriptor kind, not by name.
@@ -1077,6 +1125,19 @@ func (d *codecDecoder) resolveIface(desc *wire.Desc, target reflect.Value, p pat
 		target.Set(reflect.Zero(target.Type()))
 		return nil
 	}
+	if c, err := d.r.PeekClass(); err == nil && c == wire.ClassRef {
+		if id, ok := d.r.PeekRef(); ok {
+			if b, ok2 := d.r.PeekByteAfterRef(); ok2 && b == 0x05 {
+				if d.minor < 2 {
+					if _, err := d.r.ReadRef(); err != nil {
+						return d.mapErr(err)
+					}
+					return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail("path marker in a pre-0.2 minor stream")))
+				}
+				return d.decodePathRef(id, target, p)
+			}
+		}
+	}
 	cd, err := d.r.ReadDesc()
 	if err != nil {
 		return d.mapErr(err)
@@ -1097,16 +1158,6 @@ func (d *codecDecoder) unknownNameDetail(hint, name string) string {
 // resolveConcrete materializes a concrete dynamic value behind an already
 // read tag cd (the root position hands the tag in directly).
 func (d *codecDecoder) resolveConcrete(cd *wire.Desc, target reflect.Value, p pathNode) error {
-	if os.Getenv("GBON_TRACE") != "" {
-		_, hit := d.reg[cd.Name]
-		var rgx []string
-		for k := range d.reg {
-			if len(k) > 24 {
-				rgx = append(rgx, k)
-			}
-		}
-		fmt.Printf("TRACE resolveConcrete name=%q reg=%v long-keys=%v\n", cd.Name, hit, rgx)
-	}
 	if d.reg == nil {
 		return d.fail(errFormat(classUnknownName, d.r.Pos(), p.String(), cd.Name, nil, errDetail(d.unknownNameDetail("interface concrete type needs a type registry: use Decoder.Register", cd.Name))))
 	}
@@ -1242,6 +1293,7 @@ func (d *codecDecoder) decodeBlob(desc *wire.Desc, target reflect.Value, p pathN
 		return d.mapErr(err)
 	}
 	if class == wire.ClassView {
+		viewOff := d.r.Pos()
 		view, err := d.r.ReadView()
 		if err != nil {
 			return d.mapErr(err)
@@ -1251,6 +1303,9 @@ func (d *codecDecoder) decodeBlob(desc *wire.Desc, target reflect.Value, p pathN
 		// allocation regardless of named/unnamed byte-slice type, so a
 		// backing materialized as []byte serves a named Raw target and
 		// vice versa (Go assignability: one side unnamed)
+		if !ok && d.r.RecordExists(view.ID) {
+			return d.errEvolutionRef(viewOff, p, view.ID)
+		}
 		if !ok || !backing.Type().AssignableTo(target.Type()) {
 			return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("shared backing %d unavailable for %s", view.ID, target.Type()))))
 		}
@@ -1322,12 +1377,16 @@ func (d *codecDecoder) decodeSlice(desc *wire.Desc, target reflect.Value, p path
 		return d.mapErr(err)
 	}
 	if class == wire.ClassView {
+		viewOff := d.r.Pos()
 		view, err := d.r.ReadView()
 		if err != nil {
 			return d.mapErr(err)
 		}
 		backing, ok := d.shared[view.ID]
 		// assignability, not identity — same rule as decodeBlob's views
+		if !ok && d.r.RecordExists(view.ID) {
+			return d.errEvolutionRef(viewOff, p, view.ID)
+		}
 		if !ok || !backing.Type().AssignableTo(target.Type()) {
 			return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("shared backing %d unavailable for %s", view.ID, target.Type()))))
 		}
@@ -1377,7 +1436,7 @@ func (d *codecDecoder) decodeSlice(desc *wire.Desc, target reflect.Value, p path
 // decodeArray reconstructs an [N]T value: one ARRAY record, no view; the
 // record length must equal the descriptor/target length.
 func (d *codecDecoder) decodeArray(desc *wire.Desc, target reflect.Value, p pathNode) error {
-	L, E, _, err := d.r.ReadArrayHeader()
+	L, E, id, err := d.r.ReadArrayHeader()
 	if err != nil {
 		return d.mapErr(err)
 	}
@@ -1387,19 +1446,22 @@ func (d *codecDecoder) decodeArray(desc *wire.Desc, target reflect.Value, p path
 	if err := d.checkLen(L); err != nil {
 		return err
 	}
-	// Decode-into-temp-then-assign (decode atomicity): elements stage in
-	// a codec-owned array; the single target.Set on success is the commit
-	// point — an error in any element leaves the target untouched.
-	tmp := reflect.New(target.Type()).Elem()
-	if err := d.decodeElems(desc.Refs[0], tmp, E, p); err != nil {
+	// In-place element decode: slots materialize directly in the target
+	// — interior handles bind slot storage (7.2); the length and type
+	// checks above run before the first write, and decode atomicity
+	// rides the root snapshot-rollback.
+	if err := d.decodeElems(desc.Refs[0], target, E, p); err != nil {
 		return err
 	}
 	// Dense-prefix minimality: element [E−1] MUST NOT
 	// be bitwise zero (same predicate as the slice record path).
-	if E > 0 && isBitZero(tmp.Index(int(E-1))) {
+	if E > 0 && isBitZero(target.Index(int(E-1))) {
 		return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("array dense prefix E=%d ends in a zero element", E))))
 	}
-	target.Set(tmp)
+	// backing registration (7.2 rooting): the ARRAY record of an inline
+	// [N]T field roots its element interiors; the registered storage is
+	// the slot itself, so a path handle addresses the decoded field
+	d.shared[id] = target
 	return nil
 }
 
@@ -1778,9 +1840,13 @@ func (d *codecDecoder) decodeMap(desc *wire.Desc, target reflect.Value, p pathNo
 	if class, err := d.r.PeekClass(); err != nil {
 		return d.mapErr(err)
 	} else if class == wire.ClassRef {
+		refOff := d.r.Pos()
 		id, err := d.r.ReadRef()
 		if err != nil {
 			return d.mapErr(err)
+		}
+		if d.r.MapRecordUnmaterialized(id) {
+			return d.errEvolutionRef(refOff, p, id)
 		}
 		mv, err := d.r.MapAt(id)
 		if err != nil {
@@ -1887,25 +1953,23 @@ func (d *codecDecoder) decodeStruct(desc *wire.Desc, target reflect.Value, p pat
 	if pl.allPrim {
 		return d.decodeFlatStruct(pl, target, p)
 	}
-	// Decode-into-temp-then-assign (decode atomicity): fields stage in a
-	// codec-owned copy; the single target.Set on success is the commit
-	// point — an error anywhere above leaves the target untouched (the
-	// same discipline the container paths already follow).
-	tmp := reflect.New(target.Type()).Elem()
+	// In-place field decode: slots materialize directly in the target —
+	// interior handles bind slot storage (7.2); decode atomicity rides
+	// the root snapshot-rollback, one level for the whole value.
 	for i := range pl.fields {
 		fp := &pl.fields[i]
 		fn := pathNode{parent: &p, name: fp.name, idx: -1}
 		if fp.idx == nil {
+			d.narrowed = true
 			if err := d.skipValue(desc.Fields[i].Type, fn.String()); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := d.decodeBody(desc.Fields[i].Type, tmp.FieldByIndex(fp.idx), fn); err != nil {
+		if err := d.decodeBody(desc.Fields[i].Type, target.FieldByIndex(fp.idx), fn); err != nil {
 			return err
 		}
 	}
-	target.Set(tmp)
 	return nil
 }
 
@@ -1913,10 +1977,9 @@ func (d *codecDecoder) decodeStruct(desc *wire.Desc, target reflect.Value, p pat
 // FieldByName resolution and staging copy, byte- and budget-identical to
 // the compiled path. Test oracle for plan equivalence (P3).
 func (d *codecDecoder) decodeStructReference(desc *wire.Desc, target reflect.Value, p pathNode) error {
-	tmp := reflect.New(target.Type()).Elem()
 	for _, f := range desc.Fields {
 		fn := pathNode{parent: &p, name: f.Name, idx: -1}
-		tf := tmp.FieldByName(f.Name)
+		tf := target.FieldByName(f.Name)
 		if !tf.IsValid() || !tf.CanSet() {
 			if err := d.skipValue(f.Type, fn.String()); err != nil {
 				return err
@@ -1927,7 +1990,6 @@ func (d *codecDecoder) decodeStructReference(desc *wire.Desc, target reflect.Val
 			return err
 		}
 	}
-	target.Set(tmp)
 	return nil
 }
 
@@ -2512,6 +2574,215 @@ func (d *codecDecoder) chargeValueBody(p pathNode) (restore func(), err error) {
 	return restore, d.checkBytes(p)
 }
 
+// derivCellPending carries the deferred mandatory-elision check: a
+// derivable-spelled path body is legal only as a referenced cell's
+// body — a bare REF names the record, never the interior slot — so
+// the reject fires at value end unless a repeat REF resolved the cell.
+type derivCellPending struct {
+	id   uint64
+	mark int
+	path string
+}
+
+// checkDerivCell closes the deferred elision check at value end.
+func (d *codecDecoder) checkDerivCell() error {
+	if dc := d.derivCell; dc != nil {
+		d.derivCell = nil
+		return d.fail(errFormat(classBadPath, dc.mark, dc.path, nil, nil, errDetail("path spells the derivable descent: the canonical form is the bare REF (mandatory elision, 7.2)")))
+	}
+	return nil
+}
+
+// errEvolutionRef types the narrowing carve-out: a
+// kept REF or view resolves a record the skipped field left
+// unmaterialized — a typed reject with the kept token's offset, never a
+// generic misuse error.
+func (d *codecDecoder) errEvolutionRef(off int, p pathNode, id uint64) error {
+	if !d.narrowed {
+		// no field was skipped: the record simply never opened — the
+		// corruption class, not the narrowing carve-out
+		return d.fail(errFormat(classBadRef, off, p.String(), id, nil, errDetail(fmt.Sprintf("ref %d resolves a record whose body has not started", id))))
+	}
+	return d.fail(errFormat(classEvolutionRefUnmat, off, p.String(), id, nil, errDetail(fmt.Sprintf("kept ref %d resolves a record the narrowing skip left unmaterialized", id))))
+}
+
+// decodePathRef resolves a positional path reference (7.2): the REF of
+// the named record, the marker 05, the descent steps — a field by its
+// interned name id, an element by its backing index — and the
+// terminator 06. The handle binds the terminal slot's storage
+// (slot-storage invariant: values fill at their own tokens, each slot
+// read exactly once). The validation walk is linear in path bytes and
+// charges every step byte before any descent work; element indices
+// validate against the backing's declared length before arithmetic.
+func (d *codecDecoder) decodePathRef(id uint64, target reflect.Value, p pathNode) error {
+	if _, err := d.r.ReadRef(); err != nil {
+		return d.mapErr(err)
+	}
+	mark := d.r.Pos()
+	if _, err := d.r.ReadRawBytes(1); err != nil {
+		return d.mapErr(err)
+	}
+	if err := d.checkBytes(p); err != nil {
+		return err
+	}
+	type pstep struct {
+		elem bool
+		idx  uint64
+		name uint64
+	}
+	var steps []pstep
+	deriv := true
+	for {
+		kb, err := d.r.ReadRawBytes(1)
+		if err != nil {
+			return d.mapErr(err)
+		}
+		if err := d.checkBytes(p); err != nil {
+			return err
+		}
+		if kb[0] == 0x06 {
+			break
+		}
+		var st pstep
+		switch kb[0] {
+		case 0x00:
+			nid, err := d.r.ReadArg()
+			if err != nil {
+				return d.mapErr(err)
+			}
+			if err := d.checkBytes(p); err != nil {
+				return err
+			}
+			st.name = nid
+		case 0x01:
+			ix, err := d.r.ReadArg()
+			if err != nil {
+				return d.mapErr(err)
+			}
+			if err := d.checkBytes(p); err != nil {
+				return err
+			}
+			st.elem = true
+			st.idx = ix
+		default:
+			return d.fail(errFormat(classMalformedOp, d.r.Pos()-1, p.String(), nil, nil, errDetail(fmt.Sprintf("unknown path step kind %#x", kb[0]))))
+		}
+		steps = append(steps, st)
+	}
+	if len(steps) == 0 {
+		return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail("zero-step path: a path is step+ (7.2)")))
+	}
+	sort, rv := d.r.RecordAt(id)
+	var cur reflect.Value
+	if sort == wire.RecordValue && rv.IsValid() && !rv.IsNil() && rv.Kind() == reflect.Pointer {
+		cur = rv.Elem()
+	} else if back, ok := d.shared[id]; ok && back.IsValid() {
+		cur = back
+	} else if d.r.RecordExists(id) {
+		return d.errEvolutionRef(mark, p, id)
+	} else {
+		return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail(fmt.Sprintf("path names record %d whose body has not started", id))))
+	}
+	for i := range steps {
+		st := &steps[i]
+		last := i == len(steps)-1
+		if st.elem {
+			switch cur.Kind() {
+			case reflect.Slice, reflect.Array:
+			default:
+				return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail("element step roots at a backing record (7.2 rooting)")))
+			}
+			if st.idx >= uint64(cur.Len()) {
+				return d.fail(errFormat(classBadPath, d.r.Pos(), p.String(), st.idx, nil, errDetail(fmt.Sprintf("element index %d beyond backing length %d", st.idx, cur.Len()))))
+			}
+			et := cur.Type().Elem()
+			if !(st.idx == 0 && et.Kind() != reflect.Slice && et.Kind() != reflect.Array) {
+				deriv = false
+			}
+			cur = cur.Index(int(st.idx))
+		} else {
+			if cur.Kind() != reflect.Struct {
+				return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail("field step descends a struct record's inline storage (7.2 rooting)")))
+			}
+			name, err := d.r.StringAt(st.name)
+			if err != nil {
+				return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail("field step name is not an interned string")))
+			}
+			ft := cur.Type()
+			fi, firstNZ := -1, -1
+			for j := 0; j < ft.NumField(); j++ {
+				if ft.Field(j).Name == "_" || ft.Field(j).PkgPath != "" {
+					continue
+				}
+				if firstNZ < 0 && ft.Field(j).Type.Size() != 0 {
+					firstNZ = j
+				}
+				if ft.Field(j).Name == name {
+					fi = j
+				}
+			}
+			if fi < 0 {
+				return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail(fmt.Sprintf("field %q is not in the record's descriptor table", name))))
+			}
+			dt := ft.Field(fi).Type
+			if !(fi == firstNZ && dt.Kind() != reflect.Slice && dt.Kind() != reflect.Array) {
+				deriv = false
+			}
+			if last && dt.Size() == 0 {
+				return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail("zero-size terminal: identity of zero-size targets is neither preserved nor observable")))
+			}
+			// a coder-backed field has no descriptor field table to
+			// descend: the layout delegates to the coder (7.2)
+			for _, ce := range d.coders {
+				if ce.typ == dt {
+					return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail("coder-backed step: the field's kind delegates its layout")))
+				}
+			}
+			cur = cur.Field(fi)
+		}
+	}
+	if deriv {
+		// the round-3 carve-out: a derivable-spelled path may be a
+		// referenced cell's body; the reject is deferred to value end.
+		// A standalone cell's body is exempt outright: a cell denoting
+		// an interior position carries the explicit path form
+		// regardless of derivability (7.2 double reference)
+		if d.cellDepth == 0 {
+			d.derivCell = &derivCellPending{mark: mark, path: p.String()}
+		}
+	}
+	switch target.Kind() {
+	case reflect.Pointer:
+		if !grainCompatible(cur.Type(), target.Type().Elem()) {
+			return d.fail(errFormat(classBadPath, mark, p.String(), cur.Type(), target.Type().Elem(), errDetail("terminal slot grain out of family for the position")))
+		}
+		// the path-ref's own cell record: the writer reserved the id at
+		// this position; the reader registers the materialized handle
+		// as the cell (one cell per reserved id, 7.2 double reference;
+		// repeats bare-REF it)
+		handle := cur.Addr()
+		cid := d.r.RegisterValue(handle)
+		if dc := d.derivCell; dc != nil && dc.mark == mark {
+			dc.id = cid
+		}
+		target.Set(handle)
+		return nil
+	case reflect.Interface:
+		if cur.Kind() != reflect.Pointer && cur.Kind() != reflect.Interface {
+			return d.fail(errFormat(classBadPath, mark, p.String(), cur.Type(), target.Type(), errDetail("terminal slot's declared type is not interface-compatible")))
+		}
+		if cur.CanAddr() {
+			// the handle of a pointer-typed terminal at an interface
+			// grain is the slot's address (the encoder's cell form)
+			target.Set(cur.Addr())
+			return nil
+		}
+		target.Set(cur)
+		return nil
+	}
+	return d.fail(errFormat(classBadPath, mark, p.String(), nil, nil, errDetail("path-ref position is not a reference grain")))
+}
+
 // decodePointer reconstructs a pointer position through the uniform
 // grain resolver: the nil selector or the zero-size marker, a naked REF
 // to an open record, a grain-tagged opening (REF or DESC literal naming
@@ -2554,7 +2825,10 @@ func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pa
 		if elem.Size() != 0 {
 			d.r.RegisterValue(cell)
 		}
-		if err := d.decodeBody(desc.Refs[0], cell.Elem(), p); err != nil {
+		d.cellDepth++
+		err := d.decodeBody(desc.Refs[0], cell.Elem(), p)
+		d.cellDepth--
+		if err != nil {
 			return err
 		}
 		target.Set(cell)
@@ -2563,6 +2837,18 @@ func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pa
 		id, ok := d.r.PeekRef()
 		if !ok {
 			return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail("malformed ref token in pointer position")))
+		}
+		if b, ok := d.r.PeekByteAfterRef(); ok && b == 0x05 {
+			if d.minor < 2 {
+				// The path marker is an unknown selector in a
+				// known position for a pre-path minor — loud, at the
+				// marker, never a silent skip
+				if _, err := d.r.ReadRef(); err != nil {
+					return d.mapErr(err)
+				}
+				return d.fail(errFormat(classMalformedOp, d.r.Pos(), p.String(), nil, nil, errDetail("path marker in a pre-0.2 minor stream")))
+			}
+			return d.decodePathRef(id, target, p)
 		}
 		sort, rv := d.r.RecordAt(id)
 		if sort == wire.RecordDesc && d.grainTagAt(id, elem) {
@@ -2577,6 +2863,29 @@ func (d *codecDecoder) decodePointer(desc *wire.Desc, target reflect.Value, p pa
 		}
 		if sort == wire.RecordOther {
 			return d.fail(errFormat(classBadRef, d.r.Pos(), p.String(), nil, nil, errDetail(fmt.Sprintf("ref %d is not an object record", id))))
+		}
+		if sort == wire.RecordValue && !rv.IsValid() {
+			refOff := d.r.Pos()
+			if _, err := d.r.ReadRef(); err != nil {
+				return d.mapErr(err)
+			}
+			return d.errEvolutionRef(refOff, p, id)
+		}
+		// a cell record of the position's element type binds one
+		// pointer level up: the double reference's repeat re-boxes the
+		// handle (7.2)
+		if sort == wire.RecordValue && rv.IsValid() && !rv.IsNil() && target.Kind() == reflect.Pointer &&
+			rv.Type() == target.Type().Elem() && rv.Type() != target.Type() {
+			if _, err := d.r.ReadRef(); err != nil {
+				return d.mapErr(err)
+			}
+			if dc := d.derivCell; dc != nil && dc.id == id {
+				d.derivCell = nil
+			}
+			box := reflect.New(rv.Type())
+			box.Elem().Set(rv)
+			target.Set(box)
+			return nil
 		}
 		// a naked REF to an open record of a compatible grain
 		if sort == wire.RecordValue && rv.IsValid() && !rv.IsNil() && grainCompatible(rv.Elem().Type(), elem) {
@@ -2783,8 +3092,11 @@ func (d *codecDecoder) decodeGrainOpening(gd *wire.Desc, target reflect.Value, p
 	if gt.Size() != 0 {
 		d.r.RegisterValue(cell)
 	}
-	if err := d.decodeBody(gd, cell.Elem(), p); err != nil {
-		return err
+	d.cellDepth++
+	berr := d.decodeBody(gd, cell.Elem(), p)
+	d.cellDepth--
+	if berr != nil {
+		return berr
 	}
 	if target.Kind() != reflect.Pointer {
 		if sv, ok := descendGrainValue(cell.Elem(), target.Type()); ok {

@@ -247,6 +247,13 @@ Design facts of the GBON wire format, independent of any measurement:
 
 - **Graph round-trip** — cycles, pointer sharing, slice backing
   aliasing, and map identity survive encode/decode.
+- **Interior-slot identity (format 0.2)** — pointers into record
+  storage — struct fields, nested value-struct fields, slice- and
+  array-element interiors, blob-element interiors — round-trip as
+  shared identities through positional path references; positions
+  derivable by the canonical descent keep the bare-REF form (mandatory
+  elision). The Go projection declares full interior-slot fidelity in
+  the specification's projection-fidelity annex (Appendix D).
 - **Canonical encoding** — a stream's bytes are fixed by its value
   sequence within a memory-encounter history; equal values encode to
   equal bytes, and non-canonical byte classes are rejected on decode.
@@ -339,14 +346,23 @@ The normative wire specification lives in the companion specification
 repository, published separately from this implementation. It covers
 the stream header, value grammar, intern space and references,
 canonical encoding, decoder hygiene, versioning, and the decoder
-evolution contract. The format is at 0.0 (major 0, minor 0 — the
+evolution contract. The format is at 0.2 (major 0, minor 2 — the
 draft era): a decoder rejects unknown majors outright; minor bumps are
 additive within a major — new opcode classes, escape subclasses, and
 descriptor kinds appear only through a minor bump, and an older decoder
 either knows the extension or fails on the specific token, never
-silently skips. The specification's consolidated external anchor map —
-every cited source with its support and verification status — lives in
-the specification repository at docs/references.md.
+silently skips. This implementation encodes every stream at header
+minor 0x02 — the positional-path amendment of 0.2 rides the minor —
+and its decoder reads the 0.0, 0.1, and 0.2 streams of major 0; a
+path-carrying 0.2 stream under a 0.1 decoder fails loudly at the path
+marker (an unknown opcode in a known position, `malformed_op`), never
+silently skips. Conformance: the specification corpus — 133 vectors
+(117 legacy + 16 positional-path vectors, V-118..V-133) — passes on
+this implementation, and the gates of both repositories (this one and
+the specification's, including its cross-repo class-inventory leg) ran
+green at the cycle's close. The specification's consolidated external
+anchor map — every cited source with its support and verification
+status — lives in the specification repository at docs/references.md.
 
 Design basis: prefix-free framing (Kraft/McMillan), varint arguments
 (Elias/protobuf), graph traversal with backreferences (Schorr-Waite;
@@ -410,7 +426,25 @@ Honest list. Bugs and scope limits, not marketing:
 11. **Evolution narrowing over aliased records.** An evolution pair
     whose kept field resolves a REF or view to an aliased record the
     narrower target skipped (a shared map or shared backing) rejects
-    loud with `bad_ref` — the skipped record stays unmaterialized.
+    loud with the dedicated `evolution_ref_unmaterialized` class —
+    the skipped record stays unmaterialized (without a skipped field
+    the same shape is plain corruption, `bad_ref`).
+12. **Interior-path scope (format 0.2).** Path references address
+    inline storage only: a step never traverses a view position, an
+    interface position, or a map cell; element indices are always in
+    the backing's declared index space, never a view's local index; a
+    field whose type is coder-backed is not traversable; a terminal
+    slot of zero-size declared type rejects — identity of zero-size
+    targets is neither preserved nor observable. Violating paths
+    reject with `bad_path`.
+13. **Interior-slot tracking bound (encode).** The pre-scan tracks
+    addressable interior slots for path references up to 4,194,304
+    slots per value (`slotPopMax`); beyond the bound per-slot
+    registration stops and excess interior pointers encode as value
+    copies — wires stay valid and byte-stable, interior identity of
+    the excess slots is not preserved. Ordinary graphs sit far below
+    the bound; the bound guards pre-scan memory on factory-scale
+    shared-container graphs.
 
 Concurrency: `Marshal`/`Unmarshal` are safe for concurrent use; a
 single `Encoder` or `Decoder` is owned by one goroutine.
@@ -425,7 +459,7 @@ in this README.
 
 ## Status
 
-Pre-1.0, draft for early adopters: format 0.0 (major 0, minor 0 — the
+Pre-1.0, draft for early adopters: format 0.2 (major 0, minor 2 — the
 draft era). The API may change. The wire format is versioned and
 specified, but the library has one maintainer, no ecosystem tooling
 yet, and no stability commitments — status is not a promise. Evaluate

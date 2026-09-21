@@ -11,6 +11,7 @@ package gbon_test
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"go/format"
@@ -27,13 +28,34 @@ import (
 // snippetClasses is the full class inventory the corpus must cover.
 var snippetClasses = []string{
 	"bad_magic", "truncated", "malformed_op", "malformed_arg",
-	"overflow_value", "duplicate_key", "bad_ref", "bad_view",
-	"type_mismatch", "unknown_name",
+	"overflow_value", "duplicate_key", "bad_ref", "bad_path", "bad_view",
+	"type_mismatch", "evolution_ref_unmaterialized", "unknown_name",
 	"budget_depth", "budget_nodes", "budget_bytes", "budget_alloc",
 	"unsupported_kind", "register_conflict", "coder_error", "coder_recursion",
 	"contract_mismatch", "io_read", "io_write",
 	"internal_panic",
 	"unstable_tie_break", "unstable_zero_float_key",
+}
+
+// snippetPathS/W carry the middle-field interior alias the zero-step
+// probe corrupts.
+type snippetPathS struct{ A, B, C int64 }
+
+type snippetPathW struct {
+	V *snippetPathS
+	P *int64
+}
+
+// snippetNarrowMapW/B form the narrowing pair: the wide stream's field A
+// drops out of the narrow target, its map record stays unmaterialized
+// under the skip, and the kept field B's REF names it.
+type snippetNarrowMapW struct {
+	A map[bool]int64
+	B map[bool]int64
+}
+
+type snippetNarrowB struct {
+	B map[bool]int64
 }
 
 // snippetTieMap builds the guard's tie reject: two distinct pointers to
@@ -141,6 +163,38 @@ func snippetCorpus(t *testing.T) []snippetCase {
 	}
 	out = append(out, snippetCase{name: "internal_panic", class: "internal_panic",
 		err: pdec.Decode(&pb)})
+
+	// bad_path: a zero-step path — the marker directly before the
+	// terminator — patched into a middle-field interior-alias stream
+	ps := snippetPathS{A: 1, B: 2, C: 3}
+	pstream, err := gbon.Marshal(&snippetPathW{V: &ps, P: &ps.B})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	ph := hex.EncodeToString(pstream)
+	pi := strings.LastIndex(ph, "05")
+	zb, err := hex.DecodeString(ph[:pi] + "0506")
+	if err != nil {
+		t.Fatalf("DecodeString: %v", err)
+	}
+	var pw snippetPathW
+	out = append(out, snippetCase{name: "bad_path", class: "bad_path",
+		err: gbon.Unmarshal(zb, &pw)})
+
+	// evolution_ref_unmaterialized: a kept map-typed REF over the map
+	// record the narrowing skip left unmaterialized
+	nm := map[bool]int64{true: 1}
+	nb, err := gbon.Marshal(&snippetNarrowMapW{A: nm, B: nm})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	ndec := gbon.NewDecoder(bytes.NewReader(nb))
+	if err := ndec.RegisterAs("github.com/gbon-format/gbon-go_test.gbon_test.snippetNarrowMapW", snippetNarrowB{}); err != nil {
+		t.Fatalf("RegisterAs: %v", err)
+	}
+	var nn snippetNarrowB
+	out = append(out, snippetCase{name: "evolution_ref_unmaterialized", class: "evolution_ref_unmaterialized",
+		err: ndec.Decode(&nn)})
 
 	out = append(out, snippetCase{name: "unstable_tie_break", class: "unstable_tie_break",
 		err: stableErr(snippetTieMap())})

@@ -821,7 +821,7 @@ func TestRingEncodedBytesStable(t *testing.T) {
 	u1 := &v3x
 	u2 := &u1
 	v3x = &u2
-	pin3 := "67626f6e0001d56c0f2a2a2a696e74657266616365207b7d" +
+	pin3 := "67626f6e0002d56c0f2a2a2a696e74657266616365207b7d" +
 		"d56c0e2a2a696e74657266616365207b7dd56c0d2a696e74657266616365207b7d" +
 		"d66c0c696e74657266616365207b7dc2c4c0c8"
 	if got := fmt.Sprintf("%x", mustMarshal(t, v3x)); got != pin3 {
@@ -830,7 +830,7 @@ func TestRingEncodedBytesStable(t *testing.T) {
 	var w1x any
 	w2x := &w1x
 	w1x = &w2x
-	pin2 := "67626f6e0001d56c0e2a2a696e74657266616365207b7d" +
+	pin2 := "67626f6e0002d56c0e2a2a696e74657266616365207b7d" +
 		"d56c0d2a696e74657266616365207b7dd66c0c696e74657266616365207b7dc2c0c6"
 	if got := fmt.Sprintf("%x", mustMarshal(t, w1x)); got != pin2 {
 		t.Fatalf("depth-2 anchor: %s", got)

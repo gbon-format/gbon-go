@@ -1,15 +1,5 @@
 package gbon_test
 
-import (
-	"bytes"
-	"errors"
-	"fmt"
-	"strings"
-	"testing"
-
-	"github.com/gbon-format/gbon-go"
-)
-
 // Identity baseline of the error renders (materialization fixture): %v and
 // %+v of one crafted probe per error class, pinned as literals. The
 // materializer below regenerates this file when the baseline is empty;
@@ -19,6 +9,9 @@ import (
 var snippetIdentityBaseline = map[string][2]string{
 	"bad_magic": {"gbon: bad_magic (offset 6): wire: bad magic",
 		"gbon: bad_magic (offset 6): wire: bad magic\n    class = bad_magic\n    offset = 6\n    got = [<bytes 4 B>]\n    cause = wire: bad magic"},
+	"bad_path": {"gbon: bad_path at $.P (offset 290): zero-step path: a path is step+ (7.2)",
+		"gbon: bad_path at $.P (offset 290): zero-step path: a path is step+ (7.2)\n    class = bad_path\n    offset = 290\n    path = $.P\n    cause = zero-" +
+			"step path: a path is step+ (7.2)"},
 	"bad_ref": {"gbon: bad_ref (offset 44): wire: ref to unregistered id 100",
 		"gbon: bad_ref (offset 44): wire: ref to unregistered id 100\n    class = bad_ref\n    offset = 44\n    cause = wire: ref to unregistered id 100"},
 	"bad_view": {"gbon: bad_view (offset 30): wire: view off+cap=6 exceeds backing L=2",
@@ -653,6 +646,9 @@ var snippetIdentityBaseline = map[string][2]string{
 		"gbon: contract_mismatch: Limits.MaxDepth is negative (-1)\n    class = contract_mismatch\n    cause = Limits.MaxDepth is negative (-1)"},
 	"duplicate_key": {"gbon: duplicate_key at $[\"dupkey\"] (offset 52)",
 		"gbon: duplicate_key at $[\"dupkey\"] (offset 52)\n    class = duplicate_key\n    offset = 52\n    path = $[\"dupkey\"]"},
+	"evolution_ref_unmaterialized": {"gbon: evolution_ref_unmaterialized at $.B (offset 180): kept ref 13 resolves a record the narrowing skip left unmaterialized",
+		"gbon: evolution_ref_unmaterialized at $.B (offset 180): kept ref 13 resolves a record the narrowing skip left unmaterialized\n    class = evolution_" +
+			"ref_unmaterialized\n    offset = 180\n    path = $.B\n    got = 13\n    cause = kept ref 13 resolves a record the narrowing skip left unmaterialized"},
 	"internal_panic": {"gbon: internal_panic: unexpected panic during decode",
 		"gbon: internal_panic: unexpected panic during decode\n    class = internal_panic\n    got = [\"SNIPPETALLOCBOOM\"]\n    cause = unexpected panic dur" +
 			"ing decode"},
@@ -679,38 +675,13 @@ var snippetIdentityBaseline = map[string][2]string{
 	"unknown_name": {"gbon: unknown_name at $.V (offset 85): interface concrete type not registered: use Decoder.Register",
 		"gbon: unknown_name at $.V (offset 85): interface concrete type not registered: use Decoder.Register\n    class = unknown_name\n    offset = 85\n    " +
 			"path = $.V\n    got = [<key 18 B>]\n    cause = interface concrete type not registered: use Decoder.Register"},
+	"unstable_tie_break": {"gbon: unstable_tie_break at $[0]: map pairs tied in key skeleton and value bytes order by pointer identity",
+		"gbon: unstable_tie_break at $[0]: map pairs tied in key skeleton and value bytes order by pointer identity\n    class = unstable_tie_break\n    path" +
+			" = $[0]\n    cause = map pairs tied in key skeleton and value bytes order by pointer identity"},
+	"unstable_zero_float_key": {"gbon: unstable_zero_float_key at $[0]: map holds a zero float key of ambiguous stored sign",
+		"gbon: unstable_zero_float_key at $[0]: map holds a zero float key of ambiguous stored sign\n    class = unstable_zero_float_key\n    path = $[0]\n  " +
+			"  cause = map holds a zero float key of ambiguous stored sign"},
 	"unsupported_kind": {"gbon: unsupported_kind at $.F: unsupported kind func (func())",
 		"gbon: unsupported_kind at $.F: unsupported kind func (func())\n    class = unsupported_kind\n    path = $.F\n    cause = unsupported kind func (func" +
 			"())"},
-	"unstable_tie_break": {"gbon: unstable_tie_break at $[0]: map pairs tied in key skeleton and value bytes order by pointer identity",
-		"gbon: unstable_tie_break at $[0]: map pairs tied in key skeleton and value bytes order by pointer identity\n    class = unstable_tie_break\n    path = $[0]\n    cause = map pai" +
-			"rs tied in key skeleton and value bytes order by pointer identity"},
-	"unstable_zero_float_key": {"gbon: unstable_zero_float_key at $[0]: map holds a zero float key of ambiguous stored sign",
-		"gbon: unstable_zero_float_key at $[0]: map holds a zero float key of ambiguous stored sign\n    class = unstable_zero_float_key\n    path = $[0]\n    cause = map holds a zero fl" +
-			"oat key of ambiguous stored sign"},
-}
-
-// Trusted-mode registry-miss render (additive row): the miss fixture
-// under SetTrustedInput(true) — the detail gains the missing
-// name literal, the one-line shape is otherwise identical.
-func TestSnippetTrustedUnknownName(t *testing.T) {
-	ub, err := gbon.Marshal(struct{ V any }{struct{ X int64 }{1}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	dec := gbon.NewDecoder(bytes.NewReader(ub))
-	dec.SetTrustedInput(true)
-	var uv struct{ V any }
-	gerr := dec.Decode(&uv)
-	var ae *gbon.Error
-	if !errors.As(gerr, &ae) {
-		t.Fatalf("not As-recoverable: %v", gerr)
-	}
-	want := "gbon: unknown_name at $.V (offset 85): interface concrete type not registered: use Decoder.Register (missing name \"struct { X int64 }\")"
-	if ae.Error() != want {
-		t.Fatalf("trusted render:\n got %q\nwant %q", ae.Error(), want)
-	}
-	if v := fmt.Sprintf("%+v", ae); !strings.Contains(v, `(missing name "struct { X int64 }")`) {
-		t.Fatalf("trusted verbose render: %q", v)
-	}
 }

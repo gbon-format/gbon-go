@@ -54,7 +54,7 @@ func ExampleMarshal() {
 		return
 	}
 	fmt.Printf("% x\n", data)
-	// Output: 67 62 6f 6e 00 01 d0 6c 33 67 69 74 68 75 62 2e 63 6f 6d 2f 67 62 6f 6e 2d 66 6f 72 6d 61 74 2f 67 62 6f 6e 2d 67 6f 5f 74 65 73 74 2e 67 62 6f 6e 5f 74 65 73 74 2e 70 6f 69 6e 74 02 61 58 d8 63 69 6e 74 08 61 59 c3 b0 22 24
+	// Output: 67 62 6f 6e 00 02 d0 6c 33 67 69 74 68 75 62 2e 63 6f 6d 2f 67 62 6f 6e 2d 66 6f 72 6d 61 74 2f 67 62 6f 6e 2d 67 6f 5f 74 65 73 74 2e 67 62 6f 6e 5f 74 65 73 74 2e 70 6f 69 6e 74 02 61 58 d8 63 69 6e 74 08 61 59 c3 b0 22 24
 }
 
 func ExampleUnmarshal() {
